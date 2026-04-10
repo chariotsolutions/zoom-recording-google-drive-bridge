@@ -16,11 +16,12 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
-	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/option"
 )
@@ -82,8 +83,10 @@ func getEnvDefault(key, def string) string {
 // ----------------------------------------------------------------------------
 
 type ZoomWebhookEvent struct {
-	Event   string          `json:"event"`
-	Payload json.RawMessage `json:"payload"`
+	Event         string          `json:"event"`
+	EventTS       int64           `json:"event_ts"`
+	Payload       json.RawMessage `json:"payload"`
+	DownloadToken string          `json:"download_token"`
 }
 
 type ZoomValidationPayload struct {
@@ -107,13 +110,17 @@ type ZoomMeeting struct {
 }
 
 type RecordingFile struct {
-	ID            string `json:"id"`
-	FileType      string `json:"file_type"`
-	FileExtension string `json:"file_extension"`
-	FileSize      int64  `json:"file_size"`
-	DownloadURL   string `json:"download_url"`
-	RecordingType string `json:"recording_type"`
-	Status        string `json:"status"`
+	ID             string `json:"id"`
+	MeetingID      string `json:"meeting_id"`
+	RecordingStart string `json:"recording_start"`
+	RecordingEnd   string `json:"recording_end"`
+	FileType       string `json:"file_type"`
+	FileExtension  string `json:"file_extension"`
+	FileSize       int64  `json:"file_size"`
+	PlayURL        string `json:"play_url"`
+	DownloadURL    string `json:"download_url"`
+	RecordingType  string `json:"recording_type"`
+	Status         string `json:"status"`
 }
 
 // ----------------------------------------------------------------------------
@@ -170,14 +177,24 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	switch evt.Event {
-	case "endpoint.url_validation":
+	// The URL validation handshake is the bootstrap event and is NOT signed
+	// by Zoom — it's the proof that we know the secret in the first place.
+	if evt.Event == "endpoint.url_validation" {
 		s.handleValidation(w, evt.Payload)
 		return
+	}
 
+	// All other events must carry a valid signature.
+	timestamp := r.Header.Get("x-zm-request-timestamp")
+	signature := r.Header.Get("x-zm-signature")
+	if !verifyZoomSignature(s.cfg.ZoomWebhookSecret, timestamp, signature, body) {
+		log.Printf("signature verification failed event=%s", evt.Event)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	switch evt.Event {
 	case "recording.completed":
-		// Respond immediately so Zoom doesn't time out.
-		// Process the recording asynchronously.
 		var payload ZoomRecordingPayload
 		if err := json.Unmarshal(evt.Payload, &payload); err != nil {
 			log.Printf("invalid recording payload: %v", err)
@@ -185,13 +202,23 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if evt.DownloadToken == "" {
+			log.Printf("recording.completed missing download_token meetingID=%d", payload.Object.ID)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// Capture by value before launching goroutine.
+		downloadToken := evt.DownloadToken
+		meeting := payload.Object
+
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "OK")
 
 		go func() {
 			ctx := context.Background()
-			if err := s.processRecording(ctx, payload.Object); err != nil {
-				log.Printf("processRecording error: %v", err)
+			if err := s.processRecording(ctx, meeting, downloadToken); err != nil {
+				log.Printf("processRecording error meetingID=%d: %v", meeting.ID, err)
 			}
 		}()
 		return
@@ -229,18 +256,40 @@ func (s *Server) handleValidation(w http.ResponseWriter, raw json.RawMessage) {
 }
 
 // ----------------------------------------------------------------------------
+// Signature verification
+// ----------------------------------------------------------------------------
+
+// verifyZoomSignature checks the x-zm-signature header against an HMAC-SHA256
+// of "v0:<timestamp>:<body>" using the webhook secret. Returns true on match.
+//
+// It also rejects timestamps more than 5 minutes from now to prevent replay
+// of intercepted requests.
+func verifyZoomSignature(secret, timestamp, signatureHeader string, body []byte) bool {
+	if secret == "" || timestamp == "" || signatureHeader == "" {
+		return false
+	}
+	ts, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		return false
+	}
+	now := time.Now().Unix()
+	if diff := now - ts; diff > 300 || diff < -300 {
+		return false
+	}
+	msg := "v0:" + timestamp + ":" + string(body)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(msg))
+	expected := "v0=" + hex.EncodeToString(mac.Sum(nil))
+	return hmac.Equal([]byte(expected), []byte(signatureHeader))
+}
+
+// ----------------------------------------------------------------------------
 // Recording download → Google Drive upload (streaming)
 // ----------------------------------------------------------------------------
 
-func (s *Server) processRecording(ctx context.Context, meeting ZoomMeeting) error {
+func (s *Server) processRecording(ctx context.Context, meeting ZoomMeeting, downloadToken string) error {
 	log.Printf("processing recording: topic=%q meetingID=%d host=%s files=%d",
 		meeting.Topic, meeting.ID, meeting.HostEmail, len(meeting.RecordingFiles))
-
-	// Get Zoom OAuth access token
-	accessToken, err := s.getZoomAccessToken(ctx)
-	if err != nil {
-		return fmt.Errorf("get zoom token: %w", err)
-	}
 
 	// Initialize Drive client (uses Application Default Credentials in Cloud Run)
 	driveSvc, err := drive.NewService(ctx, option.WithScopes(drive.DriveScope))
@@ -269,7 +318,7 @@ func (s *Server) processRecording(ctx context.Context, meeting ZoomMeeting) erro
 			continue
 		}
 		filename := buildFilename(meeting.Topic, file)
-		if err := s.streamFileToDrive(ctx, driveSvc, file, accessToken, rawFolderID, filename); err != nil {
+		if err := s.streamFileToDrive(ctx, driveSvc, file, downloadToken, rawFolderID, filename); err != nil {
 			log.Printf("stream %s failed: %v", filename, err)
 			continue
 		}
@@ -304,20 +353,28 @@ func (s *Server) processRecording(ctx context.Context, meeting ZoomMeeting) erro
 
 // streamFileToDrive downloads a single recording file from Zoom and streams it
 // directly into a Google Drive upload, without buffering the whole file.
+//
+// Authentication is via the per-event download_token from the webhook payload,
+// passed as the access_token query parameter on the download URL. This is the
+// auth model Zoom requires for webhook-delivered recording files; it is NOT the
+// same as the Server-to-Server OAuth access token used for the Zoom REST API.
 func (s *Server) streamFileToDrive(
 	ctx context.Context,
 	driveSvc *drive.Service,
 	file RecordingFile,
-	accessToken string,
+	downloadToken string,
 	parentFolderID string,
 	filename string,
 ) error {
-	// Build download request with bearer token
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, file.DownloadURL, nil)
+	signedURL, err := buildSignedDownloadURL(file.DownloadURL, downloadToken)
+	if err != nil {
+		return fmt.Errorf("build signed url: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, signedURL, nil)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
+	// No Authorization header — auth is via the access_token query param.
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -344,45 +401,6 @@ func (s *Server) streamFileToDrive(
 		return fmt.Errorf("drive upload: %w", err)
 	}
 	return nil
-}
-
-// ----------------------------------------------------------------------------
-// Zoom Server-to-Server OAuth
-// ----------------------------------------------------------------------------
-
-type zoomTokenResponse struct {
-	AccessToken string `json:"access_token"`
-	ExpiresIn   int    `json:"expires_in"`
-	TokenType   string `json:"token_type"`
-}
-
-func (s *Server) getZoomAccessToken(ctx context.Context) (string, error) {
-	tokenURL := "https://zoom.us/oauth/token"
-	body := strings.NewReader(fmt.Sprintf("grant_type=account_credentials&account_id=%s", s.cfg.ZoomAccountID))
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, body)
-	if err != nil {
-		return "", err
-	}
-	req.SetBasicAuth(s.cfg.ZoomClientID, s.cfg.ZoomClientSecret)
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("zoom token status %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var tokenResp zoomTokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		return "", err
-	}
-	return tokenResp.AccessToken, nil
 }
 
 // ----------------------------------------------------------------------------
@@ -456,6 +474,20 @@ func buildFilename(topic string, file RecordingFile) string {
 	return sanitizeFilename(name)
 }
 
+// buildSignedDownloadURL appends the Zoom webhook download_token as the
+// access_token query parameter on the download URL. If access_token is
+// already present in the URL, it is replaced.
+func buildSignedDownloadURL(downloadURL, downloadToken string) (string, error) {
+	u, err := url.Parse(downloadURL)
+	if err != nil {
+		return "", err
+	}
+	q := u.Query()
+	q.Set("access_token", downloadToken)
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}
+
 func guessExtension(fileType string) string {
 	switch strings.ToUpper(fileType) {
 	case "MP4":
@@ -476,6 +508,3 @@ func guessExtension(fileType string) string {
 		return strings.ToLower(fileType)
 	}
 }
-
-// Suppress unused imports warning during scaffold
-var _ = google.DefaultClient
