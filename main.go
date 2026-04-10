@@ -342,7 +342,10 @@ func (s *Server) processRecording(ctx context.Context, meeting ZoomMeeting, down
 		Name:     "meeting-metadata.json",
 		Parents:  []string{meetingFolderID},
 		MimeType: "application/json",
-	}).Media(bytes.NewReader(metaJSON)).Do()
+	}).
+		Media(bytes.NewReader(metaJSON)).
+		SupportsAllDrives(true).
+		Do()
 	if err != nil {
 		log.Printf("write metadata: %v", err)
 	}
@@ -396,6 +399,7 @@ func (s *Server) streamFileToDrive(
 	_, err = driveSvc.Files.Create(driveFile).
 		Media(resp.Body).
 		Context(ctx).
+		SupportsAllDrives(true).
 		Do()
 	if err != nil {
 		return fmt.Errorf("drive upload: %w", err)
@@ -408,11 +412,21 @@ func (s *Server) streamFileToDrive(
 // ----------------------------------------------------------------------------
 
 func getOrCreateFolder(svc *drive.Service, parentID, name string) (string, error) {
-	// Search for an existing folder with this name under parentID
+	// Search for an existing folder with this name under parentID.
+	//
+	// SupportsAllDrives + IncludeItemsFromAllDrives are required for the
+	// query to see items inside Shared Drives (Workspace shared drives).
+	// Without them, the API silently returns no results for Shared Drive
+	// items, which presents as a 404 on subsequent operations.
 	query := fmt.Sprintf("mimeType='application/vnd.google-apps.folder' and name='%s' and '%s' in parents and trashed=false",
 		escapeQuery(name), parentID)
 
-	list, err := svc.Files.List().Q(query).Fields("files(id, name)").Do()
+	list, err := svc.Files.List().
+		Q(query).
+		Fields("files(id, name)").
+		SupportsAllDrives(true).
+		IncludeItemsFromAllDrives(true).
+		Do()
 	if err != nil {
 		return "", err
 	}
@@ -426,7 +440,10 @@ func getOrCreateFolder(svc *drive.Service, parentID, name string) (string, error
 		MimeType: "application/vnd.google-apps.folder",
 		Parents:  []string{parentID},
 	}
-	created, err := svc.Files.Create(folder).Fields("id").Do()
+	created, err := svc.Files.Create(folder).
+		Fields("id").
+		SupportsAllDrives(true).
+		Do()
 	if err != nil {
 		return "", err
 	}
