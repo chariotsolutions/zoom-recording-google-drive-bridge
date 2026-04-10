@@ -32,9 +32,6 @@ import (
 
 type Config struct {
 	ZoomWebhookSecret string
-	ZoomClientID      string
-	ZoomClientSecret  string
-	ZoomAccountID     string
 	DriveRootFolderID string
 	Port              string
 }
@@ -42,9 +39,6 @@ type Config struct {
 func loadConfig() (*Config, error) {
 	cfg := &Config{
 		ZoomWebhookSecret: os.Getenv("ZOOM_WEBHOOK_SECRET_TOKEN"),
-		ZoomClientID:      os.Getenv("ZOOM_CLIENT_ID"),
-		ZoomClientSecret:  os.Getenv("ZOOM_CLIENT_SECRET"),
-		ZoomAccountID:     os.Getenv("ZOOM_ACCOUNT_ID"),
 		DriveRootFolderID: os.Getenv("DRIVE_ROOT_FOLDER_ID"),
 		Port:              getEnvDefault("PORT", "8080"),
 	}
@@ -52,15 +46,6 @@ func loadConfig() (*Config, error) {
 	missing := []string{}
 	if cfg.ZoomWebhookSecret == "" {
 		missing = append(missing, "ZOOM_WEBHOOK_SECRET_TOKEN")
-	}
-	if cfg.ZoomClientID == "" {
-		missing = append(missing, "ZOOM_CLIENT_ID")
-	}
-	if cfg.ZoomClientSecret == "" {
-		missing = append(missing, "ZOOM_CLIENT_SECRET")
-	}
-	if cfg.ZoomAccountID == "" {
-		missing = append(missing, "ZOOM_ACCOUNT_ID")
 	}
 	if cfg.DriveRootFolderID == "" {
 		missing = append(missing, "DRIVE_ROOT_FOLDER_ID")

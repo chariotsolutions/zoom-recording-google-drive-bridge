@@ -21,10 +21,7 @@ without buffering the whole file.
 
 | Variable | Description |
 |---|---|
-| `ZOOM_WEBHOOK_SECRET_TOKEN` | From your Zoom app → Feature → Secret Token |
-| `ZOOM_CLIENT_ID` | From your Zoom app → App Credentials |
-| `ZOOM_CLIENT_SECRET` | From your Zoom app → App Credentials |
-| `ZOOM_ACCOUNT_ID` | From your Zoom app → App Credentials |
+| `ZOOM_WEBHOOK_SECRET_TOKEN` | From your Zoom Marketplace app → Feature → Secret Token |
 | `DRIVE_ROOT_FOLDER_ID` | Google Drive folder ID where recordings will land |
 | `PORT` | (Optional, defaults to 8080) |
 
@@ -51,7 +48,9 @@ gcloud run deploy zoom-recording-bridge \
   --source . \
   --region us-east1 \
   --allow-unauthenticated \
-  --set-env-vars="ZOOM_WEBHOOK_SECRET_TOKEN=...,ZOOM_CLIENT_ID=...,ZOOM_CLIENT_SECRET=...,ZOOM_ACCOUNT_ID=...,DRIVE_ROOT_FOLDER_ID=..."
+  --service-account <YOUR_SERVICE_ACCOUNT> \
+  --set-env-vars DRIVE_ROOT_FOLDER_ID=... \
+  --update-secrets ZOOM_WEBHOOK_SECRET_TOKEN=zoom-webhook-secret:latest
 ```
 
 After deployment, copy the service URL and paste it (with `/webhook` appended)
