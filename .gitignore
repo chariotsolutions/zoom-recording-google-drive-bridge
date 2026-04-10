@@ -1,6 +1,7 @@
 # Binaries
-server
-zoom-recording-google-drive-bridge
+/server
+/zoom-recording-google-drive-bridge
+/synthetic-test
 *.exe
 *.out
 
