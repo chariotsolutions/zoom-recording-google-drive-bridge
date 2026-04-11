@@ -46,7 +46,55 @@ import (
 	"time"
 )
 
+// runConfig holds the parsed flags and resolved env vars for a single
+// driver run.
+type runConfig struct {
+	bridgeURL    string
+	topic        string
+	hostEmail    string
+	reverseOrder bool
+	skipVerify   bool
+	pollTimeout  time.Duration
+	secret       string
+	rootFolderID string
+	startTime    time.Time
+	meetingID    int64
+}
+
 func main() {
+	cfg := parseFlagsAndEnv()
+
+	recordingFiles, transcriptFiles := defaultSyntheticFiles()
+	allFiles := append(append([]SyntheticFile{}, recordingFiles...), transcriptFiles...)
+
+	fake, err := startFakeServer(allFiles)
+	if err != nil {
+		exitf("start fake server: %v", err)
+	}
+	defer fake.Close()
+	fmt.Printf("[driver] fake Zoom file server: %s\n", fake.URL())
+	fmt.Printf("[driver] meetingID=%d topic=%q\n", cfg.meetingID, cfg.topic)
+
+	if err := sendEvents(cfg, fake.URL(), recordingFiles, transcriptFiles); err != nil {
+		exitf("%v", err)
+	}
+
+	if cfg.skipVerify {
+		fmt.Println("[driver] --skip-verify set; not checking Drive")
+		fmt.Println("[driver] ✓ done (both events POSTed successfully)")
+		return
+	}
+
+	if err := verifyResults(cfg, fake, recordingFiles, transcriptFiles); err != nil {
+		exitf("%v", err)
+	}
+	fmt.Println("[driver] ✓ all checks passed")
+}
+
+// parseFlagsAndEnv parses CLI flags + reads required env vars and returns a
+// fully populated runConfig. Exits the program with a useful message if any
+// required input is missing.
+func parseFlagsAndEnv() *runConfig {
 	bridgeURL := flag.String("bridge-url", "http://localhost:8080/webhook",
 		"URL of the bridge's webhook endpoint")
 	topic := flag.String("topic", "",
@@ -63,7 +111,6 @@ func main() {
 
 	secret := os.Getenv("ZOOM_WEBHOOK_SECRET_TOKEN")
 	rootFolderID := os.Getenv("DRIVE_ROOT_FOLDER_ID")
-
 	if secret == "" {
 		exitf("ZOOM_WEBHOOK_SECRET_TOKEN env var is required")
 	}
@@ -80,10 +127,25 @@ func main() {
 	if *topic == "" {
 		*topic = fmt.Sprintf("Synthetic Test %d", startTime.Unix())
 	}
-	meetingID := startTime.Unix()
+	return &runConfig{
+		bridgeURL:    *bridgeURL,
+		topic:        *topic,
+		hostEmail:    *hostEmail,
+		reverseOrder: *reverseOrder,
+		skipVerify:   *skipVerify,
+		pollTimeout:  *pollTimeout,
+		secret:       secret,
+		rootFolderID: rootFolderID,
+		startTime:    startTime,
+		meetingID:    startTime.Unix(),
+	}
+}
 
-	// The two groups of files, mirroring how real Zoom delivers them.
-	recordingFiles := []SyntheticFile{
+// defaultSyntheticFiles returns the two groups of files this driver sends:
+// the recording files (delivered in recording.completed) and the transcript
+// file (delivered in recording.transcript_completed).
+func defaultSyntheticFiles() (recording, transcript []SyntheticFile) {
+	recording = []SyntheticFile{
 		{
 			RecordingType: "shared_screen_with_speaker_view",
 			FileType:      "MP4",
@@ -106,8 +168,7 @@ func main() {
 			Content:       []byte(`[{"ts":"00:00:00","event":"meeting_started"}]`),
 		},
 	}
-
-	transcriptFiles := []SyntheticFile{
+	transcript = []SyntheticFile{
 		{
 			RecordingType: "audio_transcript",
 			FileType:      "TRANSCRIPT",
@@ -116,88 +177,77 @@ func main() {
 			Content:       []byte("WEBVTT\n\n00:00:00.000 --> 00:00:05.000\nSynthetic transcript line.\n"),
 		},
 	}
+	return recording, transcript
+}
 
-	// Start fake Zoom file server with all files from both groups.
-	fakeFiles := make(map[string][]byte)
-	for _, f := range recordingFiles {
+// startFakeServer registers all file paths in a fresh fake Zoom file server.
+func startFakeServer(allFiles []SyntheticFile) (*FakeZoomServer, error) {
+	fakeFiles := make(map[string][]byte, len(allFiles))
+	for _, f := range allFiles {
 		fakeFiles[f.FilePath] = f.Content
 	}
-	for _, f := range transcriptFiles {
-		fakeFiles[f.FilePath] = f.Content
-	}
-	fake, err := StartFakeZoomServer(fakeFiles)
-	if err != nil {
-		exitf("start fake server: %v", err)
-	}
-	defer fake.Close()
-	fmt.Printf("[driver] fake Zoom file server: %s\n", fake.URL())
-	fmt.Printf("[driver] meetingID=%d topic=%q\n", meetingID, *topic)
+	return StartFakeZoomServer(fakeFiles)
+}
 
-	downloadToken := fmt.Sprintf("synth-token-%d", meetingID)
+// sendEvents builds, signs, and POSTs the two webhook events in the order
+// dictated by cfg.reverseOrder. There's a 200ms gap between events to mimic
+// realistic spacing.
+func sendEvents(cfg *runConfig, fakeServerURL string, recordingFiles, transcriptFiles []SyntheticFile) error {
+	downloadToken := fmt.Sprintf("synth-token-%d", cfg.meetingID)
 
-	// Build both payloads
 	recordingPayload, err := BuildPayload(
 		"recording.completed",
-		*topic, *hostEmail, fake.URL(), downloadToken,
-		meetingID, recordingFiles, startTime,
+		cfg.topic, cfg.hostEmail, fakeServerURL, downloadToken,
+		cfg.meetingID, recordingFiles, cfg.startTime,
 	)
 	if err != nil {
-		exitf("build recording payload: %v", err)
+		return fmt.Errorf("build recording payload: %w", err)
 	}
 	transcriptPayload, err := BuildPayload(
 		"recording.transcript_completed",
-		*topic, *hostEmail, fake.URL(), downloadToken,
-		meetingID, transcriptFiles, startTime,
+		cfg.topic, cfg.hostEmail, fakeServerURL, downloadToken,
+		cfg.meetingID, transcriptFiles, cfg.startTime,
 	)
 	if err != nil {
-		exitf("build transcript payload: %v", err)
+		return fmt.Errorf("build transcript payload: %w", err)
 	}
 	fmt.Printf("[driver] recording.completed payload: %d bytes, %d files\n",
 		len(recordingPayload), len(recordingFiles))
 	fmt.Printf("[driver] recording.transcript_completed payload: %d bytes, %d files\n",
 		len(transcriptPayload), len(transcriptFiles))
 
-	// Determine the order to send events.
-	// Normal mode: recording.completed first, then transcript.
-	// Reverse mode: transcript first, then recording (tests the
-	// per-meeting lock's handling of out-of-order delivery).
-	first := struct {
+	type namedPayload struct {
 		name    string
 		payload []byte
-	}{"recording.completed", recordingPayload}
-	second := struct {
-		name    string
-		payload []byte
-	}{"recording.transcript_completed", transcriptPayload}
-	if *reverseOrder {
+	}
+	first := namedPayload{"recording.completed", recordingPayload}
+	second := namedPayload{"recording.transcript_completed", transcriptPayload}
+	if cfg.reverseOrder {
 		first, second = second, first
 		fmt.Println("[driver] --reverse-order: sending transcript event first")
 	}
 
-	if err := postEvent(*bridgeURL, first.name, first.payload, secret); err != nil {
-		exitf("%s: %v", first.name, err)
+	if err := postEvent(cfg.bridgeURL, first.name, first.payload, cfg.secret); err != nil {
+		return fmt.Errorf("%s: %w", first.name, err)
 	}
 	// Small gap so the second event arrives shortly after the first.
-	// In real Zoom the two events can arrive within milliseconds of each
-	// other; we use 200ms here to be realistic without waiting forever.
+	// Real Zoom delivers them within milliseconds; 200ms is realistic
+	// without making the test slow.
 	time.Sleep(200 * time.Millisecond)
-	if err := postEvent(*bridgeURL, second.name, second.payload, secret); err != nil {
-		exitf("%s: %v", second.name, err)
+	if err := postEvent(cfg.bridgeURL, second.name, second.payload, cfg.secret); err != nil {
+		return fmt.Errorf("%s: %w", second.name, err)
 	}
+	return nil
+}
 
-	if *skipVerify {
-		fmt.Println("[driver] --skip-verify set; not checking Drive")
-		fmt.Println("[driver] ✓ done (both events POSTed successfully)")
-		return
-	}
-
-	// Poll Drive for the full expected structure.
-	fmt.Printf("[driver] polling Drive for files (timeout %s)...\n", *pollTimeout)
+// verifyResults polls Drive for the expected structure and content, then
+// confirms the fake server received the expected download requests.
+func verifyResults(cfg *runConfig, fake *FakeZoomServer, recordingFiles, transcriptFiles []SyntheticFile) error {
+	fmt.Printf("[driver] polling Drive for files (timeout %s)...\n", cfg.pollTimeout)
 	expectedFolderName := fmt.Sprintf("%s-%s",
-		startTime.UTC().Format("2006-01-02"),
-		sanitizeForFolder(*topic))
+		cfg.startTime.UTC().Format("2006-01-02"),
+		sanitizeForFolder(cfg.topic))
 
-	// Union of all expected files from both events.
 	expected := []ExpectedFile{
 		{NameContains: "shared_screen_with_speaker_view", Content: recordingFiles[0].Content},
 		{NameContains: "audio_only", Content: recordingFiles[1].Content},
@@ -206,24 +256,22 @@ func main() {
 	}
 
 	ctx := context.Background()
-	if err := VerifyDrive(ctx, rootFolderID, expectedFolderName, expected, *pollTimeout); err != nil {
-		exitf("Drive verification failed: %v", err)
+	if err := VerifyDrive(ctx, cfg.rootFolderID, expectedFolderName, expected, cfg.pollTimeout); err != nil {
+		return fmt.Errorf("Drive verification failed: %w", err)
 	}
 
-	// Verify the fake server received each file exactly once.
-	allFiles := append(recordingFiles, transcriptFiles...)
+	allFiles := append(append([]SyntheticFile{}, recordingFiles...), transcriptFiles...)
 	for _, f := range allFiles {
 		hits := fake.Hits(f.FilePath)
 		if hits == 0 {
-			exitf("fake server never received request for %s — bridge may not have downloaded it", f.FilePath)
+			return fmt.Errorf("fake server never received request for %s — bridge may not have downloaded it", f.FilePath)
 		}
 		if hits > 1 {
 			fmt.Fprintf(os.Stderr, "[driver] warning: fake server got %d requests for %s (expected 1)\n",
 				hits, f.FilePath)
 		}
 	}
-
-	fmt.Println("[driver] ✓ all checks passed")
+	return nil
 }
 
 // postEvent signs the payload and POSTs it to the bridge, asserting a 200

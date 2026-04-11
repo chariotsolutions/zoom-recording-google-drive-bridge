@@ -37,75 +37,92 @@ func VerifyDrive(
 		return fmt.Errorf("create drive client: %w", err)
 	}
 
+	meetingFolderID, rawFolderID, err := pollForExpectedStructure(ctx, svc, rootFolderID, folderName, expected, pollTimeout)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("[verify] found meeting folder: %s\n", folderName)
+	fmt.Println("[verify] found raw subfolder")
+
+	if err := verifyFileContents(svc, rawFolderID, expected); err != nil {
+		return err
+	}
+	return verifyMetadataFile(svc, meetingFolderID)
+}
+
+// pollForExpectedStructure waits until the meeting folder, raw subfolder, all
+// expected files, and the metadata file are all present in Drive, or the
+// timeout elapses.
+func pollForExpectedStructure(
+	ctx context.Context,
+	svc *drive.Service,
+	rootFolderID, folderName string,
+	expected []ExpectedFile,
+	pollTimeout time.Duration,
+) (meetingFolderID, rawFolderID string, err error) {
 	deadline := time.Now().Add(pollTimeout)
-	var meetingFolderID, meetingFolderName, rawFolderID string
 	var lastErr error
 
 	for {
-		lastErr = nil
-
-		// Step A: meeting folder (exact name match)
-		if meetingFolderID == "" {
-			id, err := findChildFolder(svc, rootFolderID, folderName)
-			if err == nil {
-				meetingFolderID = id
-				meetingFolderName = folderName
-			} else {
-				lastErr = fmt.Errorf("meeting folder %q not yet present: %w", folderName, err)
-			}
+		meetingFolderID, rawFolderID, lastErr = pollOnce(svc, rootFolderID, folderName, expected, meetingFolderID, rawFolderID)
+		if lastErr == nil {
+			return meetingFolderID, rawFolderID, nil
 		}
-
-		// Step B: raw subfolder
-		if meetingFolderID != "" && rawFolderID == "" {
-			rawFolderID, err = findChildFolder(svc, meetingFolderID, "raw")
-			if err != nil {
-				lastErr = fmt.Errorf("raw subfolder not yet present: %w", err)
-			}
-		}
-
-		// Step C: expected files in raw/
-		var missingFiles []string
-		if rawFolderID != "" {
-			for _, ef := range expected {
-				_, _, err := findChildFileContaining(svc, rawFolderID, ef.NameContains)
-				if err != nil {
-					missingFiles = append(missingFiles, ef.NameContains)
-				}
-			}
-			if len(missingFiles) > 0 {
-				lastErr = fmt.Errorf("waiting for files: %v", missingFiles)
-			}
-		}
-
-		// Step D: metadata file
-		var metaPresent bool
-		if meetingFolderID != "" && len(missingFiles) == 0 && rawFolderID != "" {
-			_, _, err := findChildFileContaining(svc, meetingFolderID, "meeting-metadata.json")
-			metaPresent = (err == nil)
-			if !metaPresent {
-				lastErr = fmt.Errorf("waiting for meeting-metadata.json")
-			}
-		}
-
-		// All present?
-		if meetingFolderID != "" && rawFolderID != "" && len(missingFiles) == 0 && metaPresent {
-			break
-		}
-
 		if time.Now().After(deadline) {
-			return fmt.Errorf("polling timeout: %v", lastErr)
+			return "", "", fmt.Errorf("polling timeout: %v", lastErr)
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return "", "", ctx.Err()
 		case <-time.After(2 * time.Second):
 		}
 	}
+}
 
-	fmt.Printf("[verify] found meeting folder: %s\n", meetingFolderName)
-	fmt.Println("[verify] found raw subfolder")
+// pollOnce performs one round of folder/file lookups. It accumulates state
+// between rounds via the meetingFolderID and rawFolderID parameters (callers
+// should pass back what was returned from the previous call). Returns nil
+// error when everything expected is present.
+func pollOnce(
+	svc *drive.Service,
+	rootFolderID, folderName string,
+	expected []ExpectedFile,
+	meetingFolderID, rawFolderID string,
+) (string, string, error) {
+	if meetingFolderID == "" {
+		id, err := findChildFolder(svc, rootFolderID, folderName)
+		if err != nil {
+			return "", "", fmt.Errorf("meeting folder %q not yet present: %w", folderName, err)
+		}
+		meetingFolderID = id
+	}
+	if rawFolderID == "" {
+		id, err := findChildFolder(svc, meetingFolderID, "raw")
+		if err != nil {
+			return meetingFolderID, "", fmt.Errorf("raw subfolder not yet present: %w", err)
+		}
+		rawFolderID = id
+	}
+	var missing []string
+	for _, ef := range expected {
+		if _, _, err := findChildFileContaining(svc, rawFolderID, ef.NameContains); err != nil {
+			missing = append(missing, ef.NameContains)
+		}
+	}
+	if len(missing) > 0 {
+		return meetingFolderID, rawFolderID, fmt.Errorf("waiting for files: %v", missing)
+	}
+	if _, _, err := findChildFileContaining(svc, meetingFolderID, "meeting-metadata.json"); err != nil {
+		return meetingFolderID, rawFolderID, fmt.Errorf("waiting for meeting-metadata.json")
+	}
+	return meetingFolderID, rawFolderID, nil
+}
 
-	// Verify each file's contents match what the fake server served.
+// verifyFileContents downloads each expected file from Drive and asserts
+// that its bytes exactly match what the fake server served. This is the
+// proof that the streaming pipe (Zoom download → Drive upload) is intact.
+func verifyFileContents(svc *drive.Service, rawFolderID string, expected []ExpectedFile) error {
 	for _, ef := range expected {
 		fileID, fileName, err := findChildFileContaining(svc, rawFolderID, ef.NameContains)
 		if err != nil {
@@ -121,8 +138,13 @@ func VerifyDrive(
 		}
 		fmt.Printf("[verify] ✓ %s (%d bytes match)\n", fileName, len(got))
 	}
+	return nil
+}
 
-	// Verify metadata file structure
+// verifyMetadataFile downloads the meeting-metadata.json file from the
+// meeting folder and confirms it parses as JSON and contains the required
+// fields the bridge writes.
+func verifyMetadataFile(svc *drive.Service, meetingFolderID string) error {
 	metaID, _, err := findChildFileContaining(svc, meetingFolderID, "meeting-metadata.json")
 	if err != nil {
 		return fmt.Errorf("metadata vanished after poll: %w", err)
@@ -142,7 +164,6 @@ func VerifyDrive(
 		}
 	}
 	fmt.Printf("[verify] ✓ meeting-metadata.json present with %d fields\n", len(meta))
-
 	return nil
 }
 
