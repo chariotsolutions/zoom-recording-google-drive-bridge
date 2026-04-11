@@ -150,7 +150,6 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleRoot)
-	mux.HandleFunc("/healthz", srv.handleHealth)
 	mux.HandleFunc("/webhook", srv.handleWebhook)
 
 	log.Printf("listening on :%s", cfg.Port)
@@ -161,10 +160,6 @@ func main() {
 
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "Zoom recording → Google Drive bridge is running.")
-}
-
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintln(w, "ok")
 }
 
 // handleWebhook receives Zoom webhook POSTs.

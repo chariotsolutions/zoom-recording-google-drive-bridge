@@ -269,12 +269,17 @@ This proves:
 You can't verify the `encryptedToken` value is *correct* without knowing the
 real secret — but Zoom will verify it against the same secret in step 7.
 
-### Known gotcha: /healthz returns 404
+### Cloud Run reserves `/healthz`
 
-Cloud Run / Google Frontend reserves `/healthz` for internal use — it never
-reaches our container. The service has a `/healthz` handler in code but it's
-shadowed by the platform. This is cosmetic; `/` works for liveness checks and
-`/webhook` is what Zoom actually uses.
+Cloud Run (via Google Frontend) intercepts the `/healthz` path before it
+reaches your container and returns a 404 from Google's edge. If you ever
+need an HTTP-based health check endpoint on a Cloud Run service, use any
+path *other than* `/healthz` — e.g., `/health`, `/livez`, or `/ping`.
+
+The bridge doesn't have a dedicated health endpoint. Cloud Run's default
+startup check is a TCP probe to the configured port, which is satisfied
+automatically by our `http.ListenAndServe`. If you need a trivial
+liveness signal, `/` returns 200 with plain text.
 
 ---
 

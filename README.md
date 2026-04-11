@@ -88,8 +88,7 @@ target folder. Locally, run `gcloud auth application-default login` first.
 
 | Path | Method | Purpose |
 |---|---|---|
-| `/` | GET | Health check (returns plain text) |
-| `/healthz` | GET | Health check for Cloud Run |
+| `/` | GET | Liveness check (returns plain text) |
 | `/webhook` | POST | Zoom webhook receiver |
 
 ## Documentation
