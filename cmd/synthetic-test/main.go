@@ -1,6 +1,14 @@
-// synthetic-test sends a fully synthetic Zoom recording.completed webhook to a
-// running zoom-recording-google-drive-bridge instance and verifies that the
-// recording files land in Google Drive.
+// synthetic-test sends synthetic Zoom webhook events to a running
+// zoom-recording-google-drive-bridge instance and verifies that the recording
+// files land in Google Drive.
+//
+// The driver emulates Zoom's real two-event delivery model:
+//
+//  1. recording.completed → MP4 video, M4A audio, timeline.json
+//  2. recording.transcript_completed → VTT transcript
+//
+// Both events use the same meeting ID so they exercise the bridge's
+// per-meeting serialization lock.
 //
 // Usage:
 //
@@ -14,16 +22,16 @@
 //	# Terminal 2: run the synthetic test
 //	go run ./cmd/synthetic-test
 //
-// The driver:
-//  1. Spins up a fake Zoom file server on a random localhost port
-//  2. Builds a recording.completed payload with download_url pointing at the
-//     fake server
-//  3. Signs the payload with ZOOM_WEBHOOK_SECRET_TOKEN
-//  4. POSTs to the bridge's /webhook endpoint
-//  5. Polls Drive until the expected files appear (or times out)
-//  6. Downloads each file from Drive and compares bytes to what the fake
-//     server served (proves the streaming pipe is intact)
-//  7. Verifies meeting-metadata.json exists with the expected fields
+// Flags:
+//
+//	--bridge-url        URL of the bridge's webhook endpoint
+//	--topic             Meeting topic (default: "Synthetic Test <unix-time>")
+//	--reverse-order     Send transcript event BEFORE recording event (tests
+//	                    the per-meeting lock's handling of out-of-order
+//	                    delivery; Zoom does this ~7ms before recording.completed
+//	                    in some real observations)
+//	--skip-verify       Just POST both events, skip Drive verification
+//	--poll-timeout      How long to poll Drive before giving up (default 60s)
 package main
 
 import (
@@ -45,9 +53,11 @@ func main() {
 		"Meeting topic (defaults to 'Synthetic Test <unix-time>')")
 	hostEmail := flag.String("host-email", "synthetic@example.invalid",
 		"Host email to put in the synthetic payload")
+	reverseOrder := flag.Bool("reverse-order", false,
+		"Send transcript event before recording event (tests out-of-order delivery)")
 	skipVerify := flag.Bool("skip-verify", false,
 		"Skip Drive verification — just POST and confirm 200")
-	pollTimeout := flag.Duration("poll-timeout", 30*time.Second,
+	pollTimeout := flag.Duration("poll-timeout", 60*time.Second,
 		"How long to poll Drive for the expected folder before giving up")
 	flag.Parse()
 
@@ -70,9 +80,10 @@ func main() {
 	if *topic == "" {
 		*topic = fmt.Sprintf("Synthetic Test %d", startTime.Unix())
 	}
+	meetingID := startTime.Unix()
 
-	// 1. Build the synthetic file content. Small fixed bytes per file.
-	files := []SyntheticFile{
+	// The two groups of files, mirroring how real Zoom delivers them.
+	recordingFiles := []SyntheticFile{
 		{
 			RecordingType: "shared_screen_with_speaker_view",
 			FileType:      "MP4",
@@ -88,6 +99,16 @@ func main() {
 			Content:       bytes.Repeat([]byte("AUDIO_DATA_"), 50), // 550 bytes
 		},
 		{
+			RecordingType: "timeline",
+			FileType:      "TIMELINE",
+			FileExtension: "JSON",
+			FilePath:      "/synth-timeline.json",
+			Content:       []byte(`[{"ts":"00:00:00","event":"meeting_started"}]`),
+		},
+	}
+
+	transcriptFiles := []SyntheticFile{
+		{
 			RecordingType: "audio_transcript",
 			FileType:      "TRANSCRIPT",
 			FileExtension: "VTT",
@@ -96,9 +117,12 @@ func main() {
 		},
 	}
 
-	// 2. Start fake Zoom file server
-	fakeFiles := make(map[string][]byte, len(files))
-	for _, f := range files {
+	// Start fake Zoom file server with all files from both groups.
+	fakeFiles := make(map[string][]byte)
+	for _, f := range recordingFiles {
+		fakeFiles[f.FilePath] = f.Content
+	}
+	for _, f := range transcriptFiles {
 		fakeFiles[f.FilePath] = f.Content
 	}
 	fake, err := StartFakeZoomServer(fakeFiles)
@@ -107,53 +131,78 @@ func main() {
 	}
 	defer fake.Close()
 	fmt.Printf("[driver] fake Zoom file server: %s\n", fake.URL())
+	fmt.Printf("[driver] meetingID=%d topic=%q\n", meetingID, *topic)
 
-	// 3. Build + sign payload
-	downloadToken := fmt.Sprintf("synth-token-%d", startTime.Unix())
-	payload, err := BuildPayload(*topic, *hostEmail, fake.URL(), downloadToken, files, startTime)
+	downloadToken := fmt.Sprintf("synth-token-%d", meetingID)
+
+	// Build both payloads
+	recordingPayload, err := BuildPayload(
+		"recording.completed",
+		*topic, *hostEmail, fake.URL(), downloadToken,
+		meetingID, recordingFiles, startTime,
+	)
 	if err != nil {
-		exitf("build payload: %v", err)
+		exitf("build recording payload: %v", err)
 	}
-	timestamp, signature := Sign(secret, payload)
-	fmt.Printf("[driver] payload built: %d bytes, %d files\n", len(payload), len(files))
-
-	// 4. POST to bridge
-	fmt.Printf("[driver] POST %s\n", *bridgeURL)
-	req, err := http.NewRequest(http.MethodPost, *bridgeURL, bytes.NewReader(payload))
+	transcriptPayload, err := BuildPayload(
+		"recording.transcript_completed",
+		*topic, *hostEmail, fake.URL(), downloadToken,
+		meetingID, transcriptFiles, startTime,
+	)
 	if err != nil {
-		exitf("build request: %v", err)
+		exitf("build transcript payload: %v", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-zm-request-timestamp", timestamp)
-	req.Header.Set("x-zm-signature", signature)
+	fmt.Printf("[driver] recording.completed payload: %d bytes, %d files\n",
+		len(recordingPayload), len(recordingFiles))
+	fmt.Printf("[driver] recording.transcript_completed payload: %d bytes, %d files\n",
+		len(transcriptPayload), len(transcriptFiles))
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		exitf("POST to bridge: %v (is the bridge running on %s?)", err, *bridgeURL)
+	// Determine the order to send events.
+	// Normal mode: recording.completed first, then transcript.
+	// Reverse mode: transcript first, then recording (tests the
+	// per-meeting lock's handling of out-of-order delivery).
+	first := struct {
+		name    string
+		payload []byte
+	}{"recording.completed", recordingPayload}
+	second := struct {
+		name    string
+		payload []byte
+	}{"recording.transcript_completed", transcriptPayload}
+	if *reverseOrder {
+		first, second = second, first
+		fmt.Println("[driver] --reverse-order: sending transcript event first")
 	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		exitf("bridge returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	if err := postEvent(*bridgeURL, first.name, first.payload, secret); err != nil {
+		exitf("%s: %v", first.name, err)
 	}
-	fmt.Printf("[driver] bridge responded 200 OK\n")
+	// Small gap so the second event arrives shortly after the first.
+	// In real Zoom the two events can arrive within milliseconds of each
+	// other; we use 200ms here to be realistic without waiting forever.
+	time.Sleep(200 * time.Millisecond)
+	if err := postEvent(*bridgeURL, second.name, second.payload, secret); err != nil {
+		exitf("%s: %v", second.name, err)
+	}
 
 	if *skipVerify {
 		fmt.Println("[driver] --skip-verify set; not checking Drive")
-		fmt.Println("[driver] ✓ done (synthetic POST accepted)")
+		fmt.Println("[driver] ✓ done (both events POSTed successfully)")
 		return
 	}
 
-	// 5. Verify Drive
+	// Poll Drive for the full expected structure.
 	fmt.Printf("[driver] polling Drive for files (timeout %s)...\n", *pollTimeout)
-	// Match the exact folder name the bridge will create, not just the date
-	// prefix — otherwise the verifier picks up stale folders from earlier runs.
-	expectedFolderName := fmt.Sprintf("%s-%s", startTime.UTC().Format("2006-01-02"), sanitizeForFolder(*topic))
+	expectedFolderName := fmt.Sprintf("%s-%s",
+		startTime.UTC().Format("2006-01-02"),
+		sanitizeForFolder(*topic))
+
+	// Union of all expected files from both events.
 	expected := []ExpectedFile{
-		{NameContains: "shared_screen_with_speaker_view", Content: files[0].Content},
-		{NameContains: "audio_only", Content: files[1].Content},
-		{NameContains: "audio_transcript", Content: files[2].Content},
+		{NameContains: "shared_screen_with_speaker_view", Content: recordingFiles[0].Content},
+		{NameContains: "audio_only", Content: recordingFiles[1].Content},
+		{NameContains: "timeline", Content: recordingFiles[2].Content},
+		{NameContains: "audio_transcript", Content: transcriptFiles[0].Content},
 	}
 
 	ctx := context.Background()
@@ -161,15 +210,48 @@ func main() {
 		exitf("Drive verification failed: %v", err)
 	}
 
-	// Verify the fake server actually received the downloads (proves bridge
-	// followed the download_url + access_token path correctly)
-	for _, f := range files {
-		if fake.Hits(f.FilePath) == 0 {
+	// Verify the fake server received each file exactly once.
+	allFiles := append(recordingFiles, transcriptFiles...)
+	for _, f := range allFiles {
+		hits := fake.Hits(f.FilePath)
+		if hits == 0 {
 			exitf("fake server never received request for %s — bridge may not have downloaded it", f.FilePath)
+		}
+		if hits > 1 {
+			fmt.Fprintf(os.Stderr, "[driver] warning: fake server got %d requests for %s (expected 1)\n",
+				hits, f.FilePath)
 		}
 	}
 
 	fmt.Println("[driver] ✓ all checks passed")
+}
+
+// postEvent signs the payload and POSTs it to the bridge, asserting a 200
+// response.
+func postEvent(bridgeURL, eventName string, payload []byte, secret string) error {
+	timestamp, signature := Sign(secret, payload)
+
+	fmt.Printf("[driver] POST %s event=%s\n", bridgeURL, eventName)
+	req, err := http.NewRequest(http.MethodPost, bridgeURL, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-zm-request-timestamp", timestamp)
+	req.Header.Set("x-zm-signature", signature)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("POST: %w (is the bridge running on %s?)", err, bridgeURL)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("bridge returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	fmt.Printf("[driver]   → 200 OK\n")
+	return nil
 }
 
 func exitf(format string, args ...any) {

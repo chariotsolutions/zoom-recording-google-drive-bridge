@@ -19,18 +19,22 @@ type SyntheticFile struct {
 	Content       []byte // bytes the fake server will serve for this path
 }
 
-// BuildPayload constructs a recording.completed webhook event matching the
-// schema we verified against the Zoom Developer Docs. The download_url for
-// each file points at the fake server.
+// BuildPayload constructs a webhook event (recording.completed or
+// recording.transcript_completed) matching the schema we verified against the
+// Zoom Developer Docs. The download_url for each file points at the fake
+// server. The meetingID is passed explicitly so both events for the same
+// meeting share an ID, which is essential for testing the per-meeting
+// serialization lock.
 func BuildPayload(
-	topic, hostEmail, fakeServerURL, downloadToken string,
+	eventName, topic, hostEmail, fakeServerURL, downloadToken string,
+	meetingID int64,
 	files []SyntheticFile,
 	startTime time.Time,
 ) ([]byte, error) {
 	recordingFiles := make([]map[string]any, len(files))
 	for i, f := range files {
 		recordingFiles[i] = map[string]any{
-			"id":              fmt.Sprintf("synth-file-%d-%d", startTime.Unix(), i),
+			"id":              fmt.Sprintf("synth-file-%d-%s-%d", meetingID, eventName, i),
 			"meeting_id":      "WEz4RT2lSyKx2MD9Z+lYfA==", // dummy meeting UUID
 			"recording_start": startTime.UTC().Format(time.RFC3339),
 			"recording_end":   startTime.Add(5 * time.Minute).UTC().Format(time.RFC3339),
@@ -45,12 +49,12 @@ func BuildPayload(
 	}
 
 	event := map[string]any{
-		"event":    "recording.completed",
+		"event":    eventName,
 		"event_ts": time.Now().UnixMilli(),
 		"payload": map[string]any{
 			"account_id": "synth_account_id",
 			"object": map[string]any{
-				"id":              startTime.Unix(),
+				"id":              meetingID,
 				"uuid":            "WEz4RT2lSyKx2MD9Z+lYfA==",
 				"host_id":         "synth_host_id",
 				"host_email":      hostEmail,
