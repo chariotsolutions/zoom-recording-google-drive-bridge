@@ -244,6 +244,7 @@ func sendEvents(cfg *runConfig, fakeServerURL string, recordingFiles, transcript
 // confirms the fake server received the expected download requests.
 func verifyResults(cfg *runConfig, fake *FakeZoomServer, recordingFiles, transcriptFiles []SyntheticFile) error {
 	fmt.Printf("[driver] polling Drive for files (timeout %s)...\n", cfg.pollTimeout)
+	expectedHostFolder := localPartFromEmail(cfg.hostEmail)
 	expectedFolderName := fmt.Sprintf("%s-%s",
 		cfg.startTime.UTC().Format("2006-01-02"),
 		sanitizeForFolder(cfg.topic))
@@ -256,7 +257,7 @@ func verifyResults(cfg *runConfig, fake *FakeZoomServer, recordingFiles, transcr
 	}
 
 	ctx := context.Background()
-	if err := VerifyDrive(ctx, cfg.rootFolderID, expectedFolderName, expected, cfg.pollTimeout); err != nil {
+	if err := VerifyDrive(ctx, cfg.rootFolderID, expectedHostFolder, expectedFolderName, expected, cfg.pollTimeout); err != nil {
 		return fmt.Errorf("Drive verification failed: %w", err)
 	}
 
@@ -320,4 +321,26 @@ func sanitizeForFolder(name string) string {
 		out = out[:200]
 	}
 	return out
+}
+
+// localPartFromEmail mirrors main.hostUsername in the bridge — see that
+// function for the design rationale (lowercase, trim, sanitize, fallback
+// to "unknown-host"). Duplicated here to keep the driver in its own cmd/
+// package without sharing internals; the mirroring pattern is the same
+// one used for sanitizeFilename → sanitizeForFolder.
+func localPartFromEmail(hostEmail string) string {
+	hostEmail = strings.TrimSpace(hostEmail)
+	if hostEmail == "" {
+		return "unknown-host"
+	}
+	at := strings.LastIndex(hostEmail, "@")
+	if at <= 0 {
+		return "unknown-host"
+	}
+	local := strings.ToLower(hostEmail[:at])
+	sanitized := sanitizeForFolder(local)
+	if sanitized == "" {
+		return "unknown-host"
+	}
+	return sanitized
 }
