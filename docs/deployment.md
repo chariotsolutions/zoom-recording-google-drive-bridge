@@ -296,10 +296,19 @@ Now point Zoom at the Cloud Run URL.
    computes the HMAC and responds. Zoom verifies the HMAC against its copy of
    the secret. Expected result: a green checkmark or "Validated" confirmation.
 
-6. Under **Add Event**, select **Recording → All Recordings have completed**
+6. Under **Add Event**, subscribe to **both** of these events under the
+   **Recording** category:
 
-   This is the `recording.completed` event — the only one our service
-   currently handles.
+   - **All Recordings have completed** (`recording.completed`) — fires when
+     the MP4, M4A, and timeline files are ready
+   - **Transcript files for the recording have completed**
+     (`recording.transcript_completed`) — fires separately when Zoom's
+     transcript generation finishes, which may be seconds to minutes
+     after `recording.completed` (and very rarely slightly *before*)
+
+   Both events must be subscribed. The service handles them with the same
+   code path, using a per-meeting lock to serialize folder creation when
+   they arrive near-simultaneously.
 
 7. **Save** the event subscription
 

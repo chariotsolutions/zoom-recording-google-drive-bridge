@@ -1,21 +1,35 @@
 # zoom-recording-google-drive-bridge
 
-A small Go HTTP service that receives Zoom `recording.completed` webhooks and
-streams the recording files directly into a Google Drive folder.
+A small Go HTTP service that receives Zoom recording webhooks and streams
+the files directly into a Google Drive folder.
 
-Designed to run on Google Cloud Run. Memory usage stays constant regardless of
-file size because it streams the download from Zoom into the Drive upload
+Designed to run on Google Cloud Run. Memory usage stays constant regardless
+of file size because it streams the download from Zoom into the Drive upload
 without buffering the whole file.
 
 ## What it does
 
 1. Listens for Zoom webhook POSTs at `/webhook`
-2. Handles the `endpoint.url_validation` handshake (HMAC-SHA256 with the webhook secret)
-3. On `recording.completed`:
-   - Fetches a Zoom Server-to-Server OAuth access token
+2. Verifies the `x-zm-signature` header on every event (HMAC-SHA256 with the
+   webhook secret, 5-minute replay window)
+3. Handles the `endpoint.url_validation` handshake
+4. On `recording.completed` and `recording.transcript_completed`:
    - Creates a Drive folder structure: `<root>/<YYYY-MM-DD>-<topic>/raw/`
-   - Streams each recording file (MP4, M4A, transcript, etc.) from Zoom into Drive
-   - Writes a `meeting-metadata.json` file with meeting info
+   - Streams each recording file (MP4, M4A, timeline.json, transcript VTT)
+     from Zoom into Drive using the per-event `download_token` for auth
+   - Writes a `meeting-metadata.json` file (only on the initial
+     `recording.completed` event to avoid overwriting)
+5. Serializes concurrent events for the same meeting with a per-meeting
+   mutex, so the two events can arrive in either order without creating
+   duplicate folders
+
+### Limitations
+
+- Transcripts are not guaranteed to arrive. Zoom fires
+  `recording.transcript_completed` only when transcript generation
+  succeeds — short/silent/unsupported-language meetings may never produce
+  one. In that case the other files land normally and the folder simply
+  lacks a transcript.
 
 ## Required environment variables
 
