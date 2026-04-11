@@ -18,5 +18,8 @@ go.work.sum
 .env
 .env.local
 
+# Local-only notes / deployment values that must never be committed
+*.local.md
+
 # OS
 .DS_Store

@@ -13,7 +13,7 @@
 // Usage:
 //
 //	export ZOOM_WEBHOOK_SECRET_TOKEN=test_secret_local
-//	export DRIVE_ROOT_FOLDER_ID=<YOUR_FOLDER_ID>
+//	export DRIVE_ROOT_FOLDER_ID=<your_drive_folder_id>
 //	export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 //
 //	# Terminal 1: start the bridge

@@ -16,15 +16,16 @@ Before starting, you need:
 - **`gcloud` CLI** installed and authenticated (`gcloud auth login`)
 - **Go 1.26+** (only needed if running locally or building the binary yourself;
   Cloud Build handles compilation during deploy)
-- **A Google Cloud project** for the bridge — we use `<YOUR_PROJECT_ID>`
+- **A Google Cloud project** for the bridge
 - **A Google Drive folder** where recordings will land, accessible to the
   service account that Cloud Run will use. Workspace Shared Drives are
   supported. The folder ID is in the URL:
   `drive.google.com/drive/folders/<THIS_IS_THE_ID>`
 - **A Google Cloud service account** with **Contributor** (writer) access to
-  that folder. For Chariot this is
-  `<YOUR_SERVICE_ACCOUNT>`,
-  provisioned via our `your-provisioning-tool` tool.
+  the Drive folder. The Cloud Run service will run as this account, so it
+  needs Drive access to read/write the target folder. Create it via the
+  Google Cloud Console, `gcloud iam service-accounts create`, or whatever
+  internal provisioning tool your organization uses.
 - **A Zoom Marketplace app** of type **Server-to-Server OAuth** in your
   organization, with Event Subscriptions configured but the endpoint URL not
   yet set. You'll need its **Secret Token** (Feature → Secret Token in the
@@ -34,8 +35,8 @@ Before starting, you need:
 
 - **Cloud Run service** named `zoom-recording-bridge` in region `us-east1`
 - Built from source via Cloud Build using the repo's `Dockerfile`
-- Runs as the `<your-service-account-name>` service account (so it inherits
-  the Drive folder permissions)
+- Runs as the configured service account (so it inherits the Drive folder
+  permissions granted to that account)
 - Reads `DRIVE_ROOT_FOLDER_ID` from a plain env var
 - Reads `ZOOM_WEBHOOK_SECRET_TOKEN` from Google Secret Manager at runtime
 - Public HTTPS endpoint (`--allow-unauthenticated`); security is enforced at
@@ -186,8 +187,8 @@ gcloud run deploy zoom-recording-bridge \
   --update-secrets ZOOM_WEBHOOK_SECRET_TOKEN=zoom-webhook-secret:latest
 ```
 
-Replace `<YOUR_FOLDER_ID>` with the Drive folder ID from the prerequisites.
-For Chariot: `<YOUR_FOLDER_ID>`.
+Replace `<YOUR_FOLDER_ID>` with the Drive folder ID from the prerequisites
+(the folder ID is in the URL: `drive.google.com/drive/folders/<THIS_IS_THE_ID>`).
 
 What each flag does:
 
