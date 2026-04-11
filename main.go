@@ -20,6 +20,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/api/drive/v3"
@@ -114,6 +115,26 @@ type RecordingFile struct {
 
 type Server struct {
 	cfg *Config
+
+	// meetingLocks serializes processRecording calls that share the same
+	// meeting ID. This prevents a race between recording.completed and
+	// recording.transcript_completed when they arrive within milliseconds
+	// of each other — without serialization, both goroutines can call
+	// getOrCreateFolder concurrently and create duplicate "meeting folder"
+	// entries because Drive does not enforce name uniqueness within a
+	// parent folder.
+	//
+	// Keyed by meeting ID (int64) → *sync.Mutex. Entries are never cleaned
+	// up; Cloud Run instance lifetime is short enough that unbounded growth
+	// is not a real concern.
+	meetingLocks sync.Map
+}
+
+// meetingLock returns the mutex for a given meeting ID, creating one on
+// first use. Safe for concurrent use.
+func (s *Server) meetingLock(meetingID int64) *sync.Mutex {
+	m, _ := s.meetingLocks.LoadOrStore(meetingID, &sync.Mutex{})
+	return m.(*sync.Mutex)
 }
 
 func main() {
@@ -179,16 +200,16 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch evt.Event {
-	case "recording.completed":
+	case "recording.completed", "recording.transcript_completed":
 		var payload ZoomRecordingPayload
 		if err := json.Unmarshal(evt.Payload, &payload); err != nil {
-			log.Printf("invalid recording payload: %v", err)
+			log.Printf("invalid %s payload: %v", evt.Event, err)
 			http.Error(w, "invalid payload", http.StatusBadRequest)
 			return
 		}
 
 		if evt.DownloadToken == "" {
-			log.Printf("recording.completed missing download_token meetingID=%d", payload.Object.ID)
+			log.Printf("%s missing download_token meetingID=%d", evt.Event, payload.Object.ID)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -196,14 +217,22 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		// Capture by value before launching goroutine.
 		downloadToken := evt.DownloadToken
 		meeting := payload.Object
+		eventName := evt.Event
+
+		// Only the initial recording.completed event writes the
+		// meeting-metadata.json file. The transcript event fires separately
+		// for the same meeting; writing metadata twice would produce a
+		// second file with misleading counts (files_uploaded would reflect
+		// only the transcript).
+		writeMetadata := eventName == "recording.completed"
 
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "OK")
 
 		go func() {
 			ctx := context.Background()
-			if err := s.processRecording(ctx, meeting, downloadToken); err != nil {
-				log.Printf("processRecording error meetingID=%d: %v", meeting.ID, err)
+			if err := s.processRecording(ctx, meeting, downloadToken, writeMetadata); err != nil {
+				log.Printf("processRecording error event=%s meetingID=%d: %v", eventName, meeting.ID, err)
 			}
 		}()
 		return
@@ -272,9 +301,17 @@ func verifyZoomSignature(secret, timestamp, signatureHeader string, body []byte)
 // Recording download → Google Drive upload (streaming)
 // ----------------------------------------------------------------------------
 
-func (s *Server) processRecording(ctx context.Context, meeting ZoomMeeting, downloadToken string) error {
-	log.Printf("processing recording: topic=%q meetingID=%d host=%s files=%d",
-		meeting.Topic, meeting.ID, meeting.HostEmail, len(meeting.RecordingFiles))
+func (s *Server) processRecording(ctx context.Context, meeting ZoomMeeting, downloadToken string, writeMetadata bool) error {
+	// Serialize concurrent processRecording calls for the same meeting.
+	// This closes the race window between recording.completed and
+	// recording.transcript_completed, which Zoom may deliver within
+	// milliseconds of each other (or even out of order).
+	lock := s.meetingLock(meeting.ID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	log.Printf("processing recording: topic=%q meetingID=%d host=%s files=%d writeMetadata=%v",
+		meeting.Topic, meeting.ID, meeting.HostEmail, len(meeting.RecordingFiles), writeMetadata)
 
 	// Initialize Drive client (uses Application Default Credentials in Cloud Run)
 	driveSvc, err := drive.NewService(ctx, option.WithScopes(drive.DriveScope))
@@ -311,28 +348,33 @@ func (s *Server) processRecording(ctx context.Context, meeting ZoomMeeting, down
 		log.Printf("uploaded: %s", filename)
 	}
 
-	// Write metadata file
-	metadata := map[string]any{
-		"topic":           meeting.Topic,
-		"start_time":      meeting.StartTime,
-		"host_email":      meeting.HostEmail,
-		"meeting_id":      meeting.ID,
-		"duration":        meeting.Duration,
-		"files_uploaded":  uploaded,
-		"total_files":     len(meeting.RecordingFiles),
-		"processed_at":    time.Now().UTC().Format(time.RFC3339),
-	}
-	metaJSON, _ := json.MarshalIndent(metadata, "", "  ")
-	_, err = driveSvc.Files.Create(&drive.File{
-		Name:     "meeting-metadata.json",
-		Parents:  []string{meetingFolderID},
-		MimeType: "application/json",
-	}).
-		Media(bytes.NewReader(metaJSON)).
-		SupportsAllDrives(true).
-		Do()
-	if err != nil {
-		log.Printf("write metadata: %v", err)
+	// Write metadata file only on the initial recording.completed event.
+	// The transcript event fires separately for the same meeting; writing
+	// metadata twice would produce a second file with misleading counts.
+	if writeMetadata {
+		metadata := map[string]any{
+			"topic":                             meeting.Topic,
+			"start_time":                        meeting.StartTime,
+			"host_email":                        meeting.HostEmail,
+			"meeting_id":                        meeting.ID,
+			"duration":                          meeting.Duration,
+			"files_uploaded":                    uploaded,
+			"total_files":                       len(meeting.RecordingFiles),
+			"processed_at":                      time.Now().UTC().Format(time.RFC3339),
+			"transcript_may_arrive_separately":  true,
+		}
+		metaJSON, _ := json.MarshalIndent(metadata, "", "  ")
+		_, err = driveSvc.Files.Create(&drive.File{
+			Name:     "meeting-metadata.json",
+			Parents:  []string{meetingFolderID},
+			MimeType: "application/json",
+		}).
+			Media(bytes.NewReader(metaJSON)).
+			SupportsAllDrives(true).
+			Do()
+		if err != nil {
+			log.Printf("write metadata: %v", err)
+		}
 	}
 
 	log.Printf("done: %d/%d files uploaded to %s", uploaded, len(meeting.RecordingFiles), folderName)
