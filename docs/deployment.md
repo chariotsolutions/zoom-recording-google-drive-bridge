@@ -389,7 +389,7 @@ If all of that works, **the bridge is fully operational**.
 Whenever you push code changes and want them live on Cloud Run:
 
 ```bash
-cd ~/dev/chariot/zoom-recording-google-drive-bridge
+cd /path/to/zoom-recording-google-drive-bridge
 gcloud run deploy zoom-recording-bridge \
   --source . \
   --region us-east1 \

@@ -127,6 +127,9 @@ type Server struct {
 	// Keyed by meeting ID (int64) → *sync.Mutex. Entries are never cleaned
 	// up; Cloud Run instance lifetime is short enough that unbounded growth
 	// is not a real concern.
+	//
+	// See docs/design-decisions.md "Decision 1" for the alternatives we
+	// considered and why we landed on this approach.
 	meetingLocks sync.Map
 }
 
@@ -229,6 +232,17 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "OK")
 
+		// IMPORTANT: use context.Background() here, NOT r.Context().
+		//
+		// The HTTP request's context is canceled the moment this handler
+		// returns, which would immediately cancel the goroutine's Drive
+		// upload (the upload uses ctx internally to abort in-flight HTTP
+		// requests). The goroutine needs a fresh, never-canceled context
+		// because the work outlives the HTTP request that spawned it.
+		//
+		// This is a classic Go webhook-handler gotcha and the compiler
+		// cannot catch it — both expressions have the same type.
+		// See docs/design-decisions.md "Decision 4" for details.
 		go func() {
 			ctx := context.Background()
 			if err := s.processRecording(ctx, meeting, downloadToken, writeMetadata); err != nil {
@@ -444,7 +458,10 @@ func getOrCreateFolder(svc *drive.Service, parentID, name string) (string, error
 	// SupportsAllDrives + IncludeItemsFromAllDrives are required for the
 	// query to see items inside Shared Drives (Workspace shared drives).
 	// Without them, the API silently returns no results for Shared Drive
-	// items, which presents as a 404 on subsequent operations.
+	// items, which presents as a 404 on subsequent operations — a real
+	// production bug we caught via the synthetic test driver before our
+	// first deploy. See docs/design-decisions.md "Lesson 2" for the full
+	// story.
 	query := fmt.Sprintf("mimeType='application/vnd.google-apps.folder' and name='%s' and '%s' in parents and trashed=false",
 		escapeQuery(name), parentID)
 

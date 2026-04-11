@@ -83,3 +83,18 @@ target folder. Locally, run `gcloud auth application-default login` first.
 | `/` | GET | Health check (returns plain text) |
 | `/healthz` | GET | Health check for Cloud Run |
 | `/webhook` | POST | Zoom webhook receiver |
+
+## Documentation
+
+- [`docs/deployment.md`](./docs/deployment.md) — full deployment guide
+  (Cloud Run setup, Secret Manager, Zoom app config, end-to-end testing)
+- [`docs/design-decisions.md`](./docs/design-decisions.md) — *why* the code
+  looks the way it does: design tradeoffs, alternatives considered, and
+  bugs caught during development
+- [`docs/synthetic-test-driver.md`](./docs/synthetic-test-driver.md) —
+  the synthetic webhook test driver's design rationale
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [`LICENSE`](./LICENSE)
+for the full text and [`NOTICE`](./NOTICE) for attribution.
