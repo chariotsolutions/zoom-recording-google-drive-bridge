@@ -370,13 +370,19 @@ Open the Drive folder in your browser. You should see:
 
 ```
 <root folder>/
-  2026-04-10-Test Meeting/
-    raw/
-      Test Meeting-shared_screen_with_speaker_view.mp4
-      Test Meeting-audio_only.m4a
-      Test Meeting-audio_transcript.vtt
-    meeting-metadata.json
+  <your_username>/                           # e.g., "skapadia" — the local
+                                             # part of the host's email
+    2026-04-10-Test Meeting/
+      raw/
+        Test Meeting-shared_screen_with_speaker_view.mp4
+        Test Meeting-audio_only.m4a
+        Test Meeting-audio_transcript.vtt
+      meeting-metadata.json
 ```
+
+The bridge groups recordings by host so each consultant's meetings live in
+their own folder. Multiple meetings from the same host accumulate as
+sibling subfolders.
 
 Open the files to confirm they play/display correctly.
 

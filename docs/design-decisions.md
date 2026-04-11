@@ -209,6 +209,44 @@ context.
 
 ---
 
+## Decision 5: Per-host folder routing
+
+Recordings are routed to a Drive folder structure of
+`<root>/<host_username>/<YYYY-MM-DD>-<topic>/raw/`, where `host_username`
+is the lowercased local part of the meeting host's email (e.g., `skapadia`
+from `skapadia@chariotsolutions.com`). Each consultant's recordings end up
+in their own folder, with no behavior change required from anyone in the
+org. The host email is always present in the webhook payload, so this
+routing is reliable for every meeting.
+
+**Alternatives considered.**
+
+- **Topic-based routing** (e.g., `Sales:` prefix → `/sales/`). Rejected:
+  depends on every host following a naming convention we cannot enforce.
+  When the convention is violated — even occasionally — recordings end up
+  in the wrong folder and the layout loses its meaning.
+- **AI-based classification** (call an LLM to decide the folder per
+  meeting). Rejected: per-event API cost and operational complexity for a
+  problem that doesn't need it. The bridge's whole point is to be a cheap,
+  reliable piece of plumbing; calling out to an LLM for routing would
+  invert that.
+
+**Why lowercasing matters.** Drive folder names are case-sensitive, so
+`Skapadia@chariotsolutions.com` and `skapadia@chariotsolutions.com` would
+otherwise create two distinct folders for the same human. We lowercase at
+the routing step to make this impossible. Locking this in now is cheaper
+than discovering the problem later and writing a migration.
+
+**Known follow-up.** `getOrCreateFolder` has a latent TOCTOU race: if two
+events for *different* meetings hosted by the *same* user arrive
+simultaneously, both goroutines can call the search-then-create path
+concurrently and produce duplicate host folders. The blast radius is
+cosmetic (two folders with the same name; Drive lookups remain
+deterministic per-process) and the existing per-meeting mutex prevents
+the race for events sharing a meeting ID. Not fixed in this PR.
+
+---
+
 ## Reading order for new contributors
 
 If you are picking this codebase up for the first time, the suggested

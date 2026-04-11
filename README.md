@@ -19,7 +19,10 @@ without buffering the whole file.
    webhook secret, 5-minute replay window)
 3. Handles the `endpoint.url_validation` handshake
 4. On `recording.completed` and `recording.transcript_completed`:
-   - Creates a Drive folder structure: `<root>/<YYYY-MM-DD>-<topic>/raw/`
+   - Creates a Drive folder structure:
+     `<root>/<host_username>/<YYYY-MM-DD>-<topic>/raw/`
+     where `host_username` is the lowercased local part of the meeting
+     host's email (e.g., `skapadia` from `skapadia@chariotsolutions.com`)
    - Streams each recording file (MP4, M4A, timeline.json, transcript VTT)
      from Zoom into Drive using the per-event `download_token` for auth
    - Writes a `meeting-metadata.json` file (only on the initial
