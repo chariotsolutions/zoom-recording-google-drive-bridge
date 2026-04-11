@@ -333,11 +333,16 @@ func (s *Server) processRecording(ctx context.Context, meeting ZoomMeeting, down
 		return fmt.Errorf("create drive client: %w", err)
 	}
 
-	// Folder structure: <root>/<YYYY-MM-DD>-<topic>/raw/
+	// Folder structure: <root>/<host>/<YYYY-MM-DD>-<topic>/raw/
+	hostFolder := hostUsername(meeting.HostEmail)
 	dateStr := parseStartDate(meeting.StartTime)
-	folderName := fmt.Sprintf("%s-%s", dateStr, sanitizeFilename(meeting.Topic))
+	meetingFolderName := fmt.Sprintf("%s-%s", dateStr, sanitizeFilename(meeting.Topic))
 
-	meetingFolderID, err := getOrCreateFolder(driveSvc, s.cfg.DriveRootFolderID, folderName)
+	hostFolderID, err := getOrCreateFolder(driveSvc, s.cfg.DriveRootFolderID, hostFolder)
+	if err != nil {
+		return fmt.Errorf("create host folder: %w", err)
+	}
+	meetingFolderID, err := getOrCreateFolder(driveSvc, hostFolderID, meetingFolderName)
 	if err != nil {
 		return fmt.Errorf("create meeting folder: %w", err)
 	}
@@ -391,7 +396,7 @@ func (s *Server) processRecording(ctx context.Context, meeting ZoomMeeting, down
 		}
 	}
 
-	log.Printf("done: %d/%d files uploaded to %s", uploaded, len(meeting.RecordingFiles), folderName)
+	log.Printf("done: %d/%d files uploaded to %s/%s", uploaded, len(meeting.RecordingFiles), hostFolder, meetingFolderName)
 	return nil
 }
 
@@ -519,6 +524,35 @@ func sanitizeFilename(name string) string {
 		out = out[:200]
 	}
 	return out
+}
+
+// hostUsername extracts a folder-safe username from a Zoom host email.
+// Returns the lowercased local part of the email (everything before the
+// last @), sanitized to remove characters that would be problematic in
+// a folder name. Returns "unknown-host" if the email is empty, has no
+// @ sign, or sanitizes to an empty string.
+//
+// Lowercasing matters because Drive folder names are case-sensitive —
+// without it, "Foo@bar.com" and "foo@bar.com" would create two folders
+// for the same human.
+//
+// NOTE: cmd/synthetic-test/main.go has a mirror of this function called
+// localPartFromEmail. Keep them in sync.
+func hostUsername(hostEmail string) string {
+	hostEmail = strings.TrimSpace(hostEmail)
+	if hostEmail == "" {
+		return "unknown-host"
+	}
+	at := strings.LastIndex(hostEmail, "@")
+	if at <= 0 {
+		return "unknown-host"
+	}
+	local := strings.ToLower(hostEmail[:at])
+	sanitized := sanitizeFilename(local)
+	if sanitized == "" {
+		return "unknown-host"
+	}
+	return sanitized
 }
 
 func escapeQuery(s string) string {

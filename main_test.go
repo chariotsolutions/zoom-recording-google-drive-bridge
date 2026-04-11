@@ -365,6 +365,33 @@ func TestEscapeQuery(t *testing.T) {
 	}
 }
 
+func TestHostUsername(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"standard", "skapadia@chariotsolutions.com", "skapadia"},
+		{"mixed case lowercased", "Skapadia@Chariot.com", "skapadia"},
+		{"trailing whitespace trimmed", " foo@bar.com ", "foo"},
+		{"empty", "", "unknown-host"},
+		{"no @ sign", "foo", "unknown-host"},
+		{"@ at start", "@example.com", "unknown-host"},
+		{"just @", "@", "unknown-host"},
+		{"multiple @ uses last", "foo@bar@example.com", "foo@bar"},
+		{"slash in local part sanitized", "first/last@example.com", "first-last"},
+		{"dot and plus left alone", "first.last+tag@example.com", "first.last+tag"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hostUsername(tt.in)
+			if got != tt.want {
+				t.Errorf("hostUsername(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
 // ----------------------------------------------------------------------------
 // Tier 2: HTTP handler tests
 // ----------------------------------------------------------------------------
