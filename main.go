@@ -80,8 +80,8 @@ type ZoomValidationPayload struct {
 }
 
 type ZoomRecordingPayload struct {
-	AccountID string         `json:"account_id"`
-	Object    ZoomMeeting    `json:"object"`
+	AccountID string      `json:"account_id"`
+	Object    ZoomMeeting `json:"object"`
 }
 
 type ZoomMeeting struct {
@@ -367,15 +367,15 @@ func (s *Server) processRecording(ctx context.Context, meeting ZoomMeeting, down
 	// metadata twice would produce a second file with misleading counts.
 	if writeMetadata {
 		metadata := map[string]any{
-			"topic":                             meeting.Topic,
-			"start_time":                        meeting.StartTime,
-			"host_email":                        meeting.HostEmail,
-			"meeting_id":                        meeting.ID,
-			"duration":                          meeting.Duration,
-			"files_uploaded":                    uploaded,
-			"total_files":                       len(meeting.RecordingFiles),
-			"processed_at":                      time.Now().UTC().Format(time.RFC3339),
-			"transcript_may_arrive_separately":  true,
+			"topic":                            meeting.Topic,
+			"start_time":                       meeting.StartTime,
+			"host_email":                       meeting.HostEmail,
+			"meeting_id":                       meeting.ID,
+			"duration":                         meeting.Duration,
+			"files_uploaded":                   uploaded,
+			"total_files":                      len(meeting.RecordingFiles),
+			"processed_at":                     time.Now().UTC().Format(time.RFC3339),
+			"transcript_may_arrive_separately": true,
 		}
 		metaJSON, _ := json.MarshalIndent(metadata, "", "  ")
 		_, err = driveSvc.Files.Create(&drive.File{

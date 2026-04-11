@@ -146,7 +146,6 @@ func VerifyDrive(
 	return nil
 }
 
-
 func findChildFolder(svc *drive.Service, parentID, name string) (string, error) {
 	query := fmt.Sprintf(
 		"mimeType='application/vnd.google-apps.folder' and name='%s' and '%s' in parents and trashed=false",

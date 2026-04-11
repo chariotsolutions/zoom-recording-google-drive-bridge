@@ -569,6 +569,7 @@ func TestSignForRoundtrip(t *testing.T) {
 }
 
 // Diagnostic helper used in failing tests to dump useful info.
+//
 //nolint:unused
 func dumpRequest(t *testing.T, prefix string, rec *httptest.ResponseRecorder) {
 	t.Helper()
