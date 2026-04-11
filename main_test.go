@@ -499,6 +499,48 @@ func TestHandleWebhook_MethodNotAllowed(t *testing.T) {
 	}
 }
 
+func TestHandleWebhook_TranscriptCompleted(t *testing.T) {
+	srv := newTestServer()
+	// Signed transcript event, no download_token → 200 + bail (same as
+	// the recording.completed path). We can't verify the downstream
+	// processRecording call without interfaces, but we can verify the
+	// handler accepts the event and dispatches on the new case.
+	body := []byte(`{"event":"recording.transcript_completed","payload":{"object":{"id":1,"topic":"test","recording_files":[]}}}`)
+	now := strconv.FormatInt(time.Now().Unix(), 10)
+
+	rec := postWebhook(t, srv, body, true, now)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleWebhook_TranscriptUnsignedRejected(t *testing.T) {
+	srv := newTestServer()
+	body := []byte(`{"event":"recording.transcript_completed","payload":{"object":{}}}`)
+
+	rec := postWebhook(t, srv, body, false, "")
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401; body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMeetingLockSerializesSameMeeting(t *testing.T) {
+	srv := newTestServer()
+	// Same meeting ID → same mutex
+	lock1 := srv.meetingLock(42)
+	lock2 := srv.meetingLock(42)
+	if lock1 != lock2 {
+		t.Errorf("expected same mutex for same meeting ID")
+	}
+	// Different meeting ID → different mutex
+	lock3 := srv.meetingLock(43)
+	if lock1 == lock3 {
+		t.Errorf("expected different mutex for different meeting ID")
+	}
+}
+
 func TestHandleWebhook_UnknownEvent(t *testing.T) {
 	srv := newTestServer()
 	body := []byte(`{"event":"meeting.started","payload":{}}`)
