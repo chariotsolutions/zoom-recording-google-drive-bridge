@@ -1,0 +1,63 @@
+# Continuous integration: build, vet, format check, and test with the race
+# detector. Runs on every push to main and every pull request targeting main.
+#
+# This catches the same things we run by hand:
+#   - go build ./...
+#   - go vet ./...
+#   - gofmt -s (the simplify pass — what dragged Go Report Card to a B before)
+#   - go test -race ./...
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Read-only permissions; the workflow doesn't need to write to the repo.
+permissions:
+  contents: read
+
+# If a new commit lands while a previous run is still in flight on the same
+# ref, cancel the older run to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build · vet · gofmt · test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Pull the Go version from go.mod so this stays in sync with the
+          # project's declared minimum version automatically.
+          go-version-file: go.mod
+          # setup-go@v5 enables module/build caching by default.
+          cache: true
+
+      - name: Verify gofmt -s
+        run: |
+          unformatted=$(gofmt -s -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::The following files are not gofmt -s clean:"
+            echo "$unformatted"
+            echo ""
+            echo "Run 'gofmt -s -w .' locally to fix."
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test with race detector
+        run: go test -race ./...
