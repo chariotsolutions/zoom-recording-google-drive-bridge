@@ -37,14 +37,12 @@ echo "Tailing logs for $SERVICE in $REGION (project: $PROJECT)"
 echo ""
 
 # Show the last N log entries in chronological order (oldest first).
-# gcloud returns newest-first by default, so we reverse with tail -r
-# (macOS). On Linux, replace 'tail -r' with 'tac'.
 echo "=== Last $HISTORY log entries ==="
 echo ""
 gcloud run services logs read "$SERVICE" \
   --region="$REGION" \
   --project="$PROJECT" \
-  --limit="$HISTORY" 2>/dev/null | tail -r || true
+  --limit="$HISTORY" 2>/dev/null || true
 echo ""
 echo "=== Live tail (Ctrl+C to stop) ==="
 echo ""
