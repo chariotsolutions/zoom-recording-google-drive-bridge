@@ -169,7 +169,11 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	// Cap the body at 1 MB to prevent oversized payloads from burning
+	// memory before the signature check runs. Zoom's recording.completed
+	// payloads are a few KB at most; 1 MB is generous for any legitimate
+	// event. Truncated bodies will fail json.Unmarshal → 400.
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		http.Error(w, "failed to read body", http.StatusBadRequest)
 		return

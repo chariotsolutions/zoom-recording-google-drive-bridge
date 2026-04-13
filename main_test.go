@@ -515,6 +515,23 @@ func TestHandleWebhook_MalformedJSON(t *testing.T) {
 	}
 }
 
+func TestHandleWebhook_OversizedBodyRejected(t *testing.T) {
+	srv := newTestServer()
+	// 2 MB of junk — well over the 1 MB limit. After truncation the
+	// body won't be valid JSON, so the handler returns 400.
+	body := make([]byte, 2<<20)
+	for i := range body {
+		body[i] = 'x'
+	}
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	srv.handleWebhook(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400; body=%q", rec.Code, rec.Body.String())
+	}
+}
+
 func TestHandleWebhook_MethodNotAllowed(t *testing.T) {
 	srv := newTestServer()
 	req := httptest.NewRequest(http.MethodGet, "/webhook", nil)
