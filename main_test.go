@@ -392,6 +392,97 @@ func TestHostUsername(t *testing.T) {
 	}
 }
 
+func TestBuildMeetingFolderName(t *testing.T) {
+	tests := []struct {
+		name    string
+		meeting ZoomMeeting
+		want    string
+	}{
+		{
+			name: "standard meeting",
+			meeting: ZoomMeeting{
+				Topic:     "Weekly Standup",
+				StartTime: "2026-04-11T14:30:00Z",
+			},
+			want: "2026-04-11T14-30-Weekly Standup",
+		},
+		{
+			name: "same topic different time produces different name",
+			meeting: ZoomMeeting{
+				Topic:     "Weekly Standup",
+				StartTime: "2026-04-11T18:00:00Z",
+			},
+			want: "2026-04-11T18-00-Weekly Standup",
+		},
+		{
+			name: "topic with special chars sanitized",
+			meeting: ZoomMeeting{
+				Topic:     "Sales: Acme Corp / Q2",
+				StartTime: "2026-04-11T09:00:00Z",
+			},
+			want: "2026-04-11T09-00-Sales- Acme Corp - Q2",
+		},
+		{
+			name: "empty start time",
+			meeting: ZoomMeeting{
+				Topic:     "My Meeting",
+				StartTime: "",
+			},
+			want: "unknown-date-My Meeting",
+		},
+		{
+			name: "malformed start time",
+			meeting: ZoomMeeting{
+				Topic:     "My Meeting",
+				StartTime: "not-a-date",
+			},
+			want: "unknown-date-My Meeting",
+		},
+		{
+			name: "empty topic",
+			meeting: ZoomMeeting{
+				Topic:     "",
+				StartTime: "2026-04-11T10:00:00Z",
+			},
+			want: "2026-04-11T10-00-Untitled Meeting",
+		},
+		{
+			name: "empty everything",
+			meeting: ZoomMeeting{
+				Topic:     "",
+				StartTime: "",
+			},
+			want: "unknown-date-Untitled Meeting",
+		},
+		{
+			name: "timezone offset in start time still parses as UTC output",
+			meeting: ZoomMeeting{
+				Topic:     "Team Call",
+				StartTime: "2026-04-11T14:30:00-04:00",
+			},
+			want: "2026-04-11T18-30-Team Call", // converted to UTC
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := buildMeetingFolderName(tt.meeting)
+			if got != tt.want {
+				t.Errorf("buildMeetingFolderName() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	// Explicit collision test: two meetings with the same topic and date
+	// but different start times MUST produce different folder names.
+	meeting1 := ZoomMeeting{Topic: "Weekly Standup", StartTime: "2026-04-11T14:00:00Z", ID: 111}
+	meeting2 := ZoomMeeting{Topic: "Weekly Standup", StartTime: "2026-04-11T16:00:00Z", ID: 222}
+	name1 := buildMeetingFolderName(meeting1)
+	name2 := buildMeetingFolderName(meeting2)
+	if name1 == name2 {
+		t.Errorf("collision: two different meetings produced the same folder name %q", name1)
+	}
+}
+
 // ----------------------------------------------------------------------------
 // Tier 2: HTTP handler tests
 // ----------------------------------------------------------------------------

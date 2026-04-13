@@ -332,16 +332,15 @@ func (s *Server) processRecording(ctx context.Context, meeting ZoomMeeting, down
 		return fmt.Errorf("create drive client: %w", err)
 	}
 
-	// Folder structure: <root>/<host>/<YYYY-MM-DD>-<topic>/raw/
+	// Folder structure: <root>/<host>/<YYYY-MM-DDThh-mm>-<topic>/raw/
 	hostFolder := hostUsername(meeting.HostEmail)
-	dateStr := parseStartDate(meeting.StartTime)
-	meetingFolderName := fmt.Sprintf("%s-%s", dateStr, sanitizeFilename(meeting.Topic))
+	mfn := buildMeetingFolderName(meeting)
 
 	hostFolderID, err := getOrCreateFolder(driveSvc, s.cfg.DriveRootFolderID, hostFolder)
 	if err != nil {
 		return fmt.Errorf("create host folder: %w", err)
 	}
-	meetingFolderID, err := getOrCreateFolder(driveSvc, hostFolderID, meetingFolderName)
+	meetingFolderID, err := getOrCreateFolder(driveSvc, hostFolderID, mfn)
 	if err != nil {
 		return fmt.Errorf("create meeting folder: %w", err)
 	}
@@ -395,7 +394,7 @@ func (s *Server) processRecording(ctx context.Context, meeting ZoomMeeting, down
 		}
 	}
 
-	log.Printf("done: %d/%d files uploaded to %s/%s", uploaded, len(meeting.RecordingFiles), hostFolder, meetingFolderName)
+	log.Printf("done: %d/%d files uploaded to %s/%s", uploaded, len(meeting.RecordingFiles), hostFolder, mfn)
 	return nil
 }
 
@@ -511,6 +510,35 @@ func parseStartDate(startTime string) string {
 		return "unknown-date"
 	}
 	return t.Format("2006-01-02")
+}
+
+// buildMeetingFolderName produces a folder name that includes both the
+// date and the UTC start time of the meeting, so two meetings with the
+// same topic on the same day get distinct folders. Format:
+//
+//	2026-04-11T18-00-Weekly Standup
+//
+// The time is always UTC (Zoom's start_time is always UTC regardless of
+// the host's timezone). Using UTC avoids timezone conversion code and
+// keeps the name deterministic. If the start_time is missing or
+// malformed, falls back to date-only (which is still better than nothing).
+//
+// NOTE: cmd/synthetic-test/main.go has a mirror of this function called
+// buildExpectedMeetingFolderName. Keep them in sync.
+func buildMeetingFolderName(meeting ZoomMeeting) string {
+	topic := sanitizeFilename(meeting.Topic)
+	if topic == "" {
+		topic = "Untitled Meeting"
+	}
+	if meeting.StartTime == "" {
+		return "unknown-date-" + topic
+	}
+	t, err := time.Parse(time.RFC3339, meeting.StartTime)
+	if err != nil {
+		return "unknown-date-" + topic
+	}
+	t = t.UTC()
+	return fmt.Sprintf("%sT%s-%s", t.Format("2006-01-02"), t.Format("15-04"), topic)
 }
 
 func sanitizeFilename(name string) string {

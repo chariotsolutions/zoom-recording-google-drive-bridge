@@ -245,9 +245,7 @@ func sendEvents(cfg *runConfig, fakeServerURL string, recordingFiles, transcript
 func verifyResults(cfg *runConfig, fake *FakeZoomServer, recordingFiles, transcriptFiles []SyntheticFile) error {
 	fmt.Printf("[driver] polling Drive for files (timeout %s)...\n", cfg.pollTimeout)
 	expectedHostFolder := localPartFromEmail(cfg.hostEmail)
-	expectedFolderName := fmt.Sprintf("%s-%s",
-		cfg.startTime.UTC().Format("2006-01-02"),
-		sanitizeForFolder(cfg.topic))
+	expectedFolderName := buildExpectedMeetingFolderName(cfg.startTime, cfg.topic)
 
 	expected := []ExpectedFile{
 		{NameContains: "shared_screen_with_speaker_view", Content: recordingFiles[0].Content},
@@ -321,6 +319,19 @@ func sanitizeForFolder(name string) string {
 		out = out[:200]
 	}
 	return out
+}
+
+// buildExpectedMeetingFolderName mirrors main.buildMeetingFolderName in
+// the bridge — see that function for design rationale (UTC start time in
+// the folder name to disambiguate same-topic-same-day meetings).
+// Duplicated here to keep the driver in its own cmd/ package.
+func buildExpectedMeetingFolderName(startTime time.Time, topic string) string {
+	sanitized := sanitizeForFolder(topic)
+	if sanitized == "" {
+		sanitized = "Untitled Meeting"
+	}
+	t := startTime.UTC()
+	return fmt.Sprintf("%sT%s-%s", t.Format("2006-01-02"), t.Format("15-04"), sanitized)
 }
 
 // localPartFromEmail mirrors main.hostUsername in the bridge — see that
