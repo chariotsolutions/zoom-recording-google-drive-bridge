@@ -45,19 +45,33 @@ echo "SA:           $SERVICE_ACCOUNT"
 echo "queue:        $QUEUE_NAME"
 echo ""
 
+echo "-- enabling Cloud Tasks API (idempotent) --"
+gcloud services enable cloudtasks.googleapis.com --project="$PROJECT_ID"
+
+echo ""
 echo "-- creating Cloud Tasks queue --"
 # max-concurrent-dispatches=1 serializes task execution, which replaces
 # the in-process per-meeting mutex the bridge used to carry.
 # max-retry-duration=14400s (4h) is comfortably under Zoom's 24h
 # download_token validity window.
-gcloud tasks queues create "$QUEUE_NAME" \
-  --project="$PROJECT_ID" \
-  --location="$REGION" \
-  --max-dispatches-per-second=10 \
-  --max-concurrent-dispatches=1 \
-  --max-attempts=10 \
-  --max-retry-duration=14400s \
-  || echo "(queue '$QUEUE_NAME' may already exist — continuing)"
+# Swallow only the specific "ALREADY_EXISTS" error so re-runs are
+# idempotent; other errors (permission denied, bad args, etc.) surface.
+if ! gcloud tasks queues create "$QUEUE_NAME" \
+    --project="$PROJECT_ID" \
+    --location="$REGION" \
+    --max-dispatches-per-second=10 \
+    --max-concurrent-dispatches=1 \
+    --max-attempts=10 \
+    --max-retry-duration=14400s 2>&1 | tee /tmp/provision-cloud-tasks.log; then
+  if grep -q "ALREADY_EXISTS" /tmp/provision-cloud-tasks.log; then
+    echo "(queue '$QUEUE_NAME' already exists — continuing)"
+  else
+    echo "queue creation failed for an unexpected reason — see error above"
+    rm -f /tmp/provision-cloud-tasks.log
+    exit 1
+  fi
+fi
+rm -f /tmp/provision-cloud-tasks.log
 
 echo ""
 echo "-- granting roles/cloudtasks.enqueuer to $SERVICE_ACCOUNT --"

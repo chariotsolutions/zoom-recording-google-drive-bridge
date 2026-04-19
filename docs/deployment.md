@@ -72,7 +72,8 @@ gcloud services enable \
   run.googleapis.com \
   cloudbuild.googleapis.com \
   artifactregistry.googleapis.com \
-  secretmanager.googleapis.com
+  secretmanager.googleapis.com \
+  cloudtasks.googleapis.com
 ```
 
 What each one does:
@@ -83,6 +84,7 @@ What each one does:
 | `cloudbuild.googleapis.com` | Builds the Docker image from source |
 | `artifactregistry.googleapis.com` | Stores the built container images |
 | `secretmanager.googleapis.com` | Holds the Zoom webhook secret |
+| `cloudtasks.googleapis.com` | Async processing queue for recording downloads |
 
 Also make sure the Drive API is enabled (required for the running service to
 talk to Google Drive):
@@ -99,11 +101,12 @@ gcloud services list --enabled --filter="config.name:(
   cloudbuild.googleapis.com OR
   artifactregistry.googleapis.com OR
   secretmanager.googleapis.com OR
+  cloudtasks.googleapis.com OR
   drive.googleapis.com
 )"
 ```
 
-You should see all five listed.
+You should see all six listed.
 
 ---
 
