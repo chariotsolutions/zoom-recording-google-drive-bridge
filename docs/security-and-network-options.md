@@ -21,8 +21,8 @@ endpoint from abuse?
 
 ## Current security posture
 
-The bridge has six layers of defense today, all at the application or
-platform level:
+The bridge has the following layers of defense today, all at the
+application or platform level:
 
 | Layer | What it does | Protects against |
 |---|---|---|
@@ -30,6 +30,8 @@ platform level:
 | **HMAC-SHA256 signature verification** | Zoom signs each event body with a shared secret; the bridge computes the same HMAC and compares with `hmac.Equal` (constant-time) | Forged webhook events from anyone who doesn't know the secret |
 | **5-minute replay window** | Rejects events with timestamps older than 5 minutes | Replaying a captured valid signed request after the fact |
 | **Request body size limit** | `io.LimitReader` caps the body at 1 MB (see [issue #4](https://github.com/chariotsolutions/zoom-recording-google-drive-bridge/issues/4)) | Oversized payloads burning memory before the signature check runs |
+| **Global rate limiting** | Token-bucket limiter in front of `/webhook`: 10 rps sustained / burst 20; returns 429 before body read or HMAC (see [issue #6](https://github.com/chariotsolutions/zoom-recording-google-drive-bridge/issues/6)) | Burning CPU on forged traffic from a single source below the DDoS threshold |
+| **`max-instances=1` on Cloud Run** | Caps horizontal scaling at one container; the in-process per-meeting mutex is sufficient at Chariot's webhook volume | Runaway autoscaling cost if the endpoint is hammered |
 | **Distroless container** | No shell, no package manager, no system tools in the runtime image | Post-exploitation lateral movement — if an attacker somehow gets code execution, there's nothing to use |
 | **Scoped service account** | Cloud Run runs as a service account that only has Contributor access to one specific Drive folder | Blast radius containment — even if compromised, the service can only write to that one folder |
 | **Secret in Secret Manager** | The webhook secret is never in code, env vars, shell history, or git | Secret leakage via repo, deploy logs, or process listing |
@@ -45,13 +47,17 @@ are defense-in-depth that most webhook services don't bother with.
 ### What this posture is missing
 
 **No network-layer controls on inbound traffic.** Anyone on the internet
-can send HTTP requests to the endpoint. The HMAC check rejects them
-immediately (before any Drive work happens), but the requests still
-reach the application — consuming a cold start, CPU for the signature
-computation, and a small amount of Cloud Run billing.
+can send HTTP requests to the endpoint. The rate limiter and HMAC check
+reject forged requests before any Drive work happens, but the requests
+still reach the application — consuming a cold start and a small amount
+of Cloud Run billing.
 
-For targeted abuse below the DDoS threshold, there's no mechanism to
-block traffic before it reaches our code.
+**No per-IP rate limiting.** The token bucket in front of `/webhook` is
+global: a single attacker at the threshold still consumes all the
+available capacity, meaning legitimate Zoom traffic could be rejected
+during abuse. Per-IP enforcement is Cloud Armor's job (Option 2); the
+application-layer limiter is not the right place to track IPs given
+Cloud Run's ephemeral-instance model.
 
 ---
 
@@ -59,11 +65,11 @@ block traffic before it reaches our code.
 
 ### Option 1: Stay with application-layer security only (current)
 
-Keep the existing six-layer posture. No network-level filtering.
+Keep the existing application-layer posture. No network-level filtering.
 
 - **Monthly cost:** ~$0 (Cloud Run scales to zero)
 - **IP allowlisting:** ❌
-- **Rate limiting:** ❌ (beyond Google Frontend's baseline DDoS protection)
+- **Rate limiting:** ✅ global (application-layer token bucket); ❌ per-IP
 - **Operational overhead:** Minimal
 - **When to choose:** The threat model doesn't require network-layer
   controls (no regulated-client mandate, no compliance checkbox, no
@@ -179,8 +185,8 @@ the Dockerfile control we use for distroless.
 
 | Option | Monthly cost | Scale to zero | IP allowlisting | Rate limiting | Ops overhead |
 |---|---|---|---|---|---|
-| **Cloud Run alone** (current) | ~$0 | ✅ | ❌ | ❌ | Minimal |
-| **Cloud Run + LB + Cloud Armor** | ~$23 | ✅ | ✅ | ✅ | Low |
+| **Cloud Run alone** (current) | ~$0 | ✅ | ❌ | ✅ global / ❌ per-IP | Minimal |
+| **Cloud Run + LB + Cloud Armor** | ~$23 | ✅ | ✅ | ✅ per-IP | Low |
 | **Compute Engine VM** | ~$5–25 | ❌ | ✅ | ❌ | High |
 | **GKE Autopilot** | ~$75+ | ❌ | ✅ | ✅ | Moderate |
 | **Cloud Functions** | ~$0 | ✅ | ❌ | ❌ | Minimal |

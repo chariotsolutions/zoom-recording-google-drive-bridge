@@ -23,8 +23,18 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/time/rate"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/option"
+)
+
+// rateLimitRPS and rateLimitBurst are the global token-bucket parameters
+// for /webhook. Both are well above legitimate Zoom traffic (events
+// arrive seconds apart at most, a handful per day), so the limiter only
+// trips under abusive load. Hardcoded for v1 — see issue #6.
+const (
+	rateLimitRPS   = 10
+	rateLimitBurst = 20
 )
 
 // ----------------------------------------------------------------------------
@@ -148,9 +158,13 @@ func main() {
 
 	srv := &Server{cfg: cfg}
 
+	// Single process-wide limiter shared across all /webhook requests.
+	// Rejected requests return 429 before any body read or HMAC work.
+	limiter := rate.NewLimiter(rate.Limit(rateLimitRPS), rateLimitBurst)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleRoot)
-	mux.HandleFunc("/webhook", srv.handleWebhook)
+	mux.Handle("/webhook", rateLimitMiddleware(limiter, http.HandlerFunc(srv.handleWebhook)))
 
 	log.Printf("listening on :%s", cfg.Port)
 	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
@@ -160,6 +174,26 @@ func main() {
 
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "Zoom recording → Google Drive bridge is running.")
+}
+
+// rateLimitMiddleware wraps an http.Handler with a token-bucket rate
+// limiter. Requests that exceed the limit are rejected with 429 before
+// the wrapped handler runs — so signature verification, body reads, and
+// Drive work are all skipped on rejected requests.
+//
+// The limiter is global (not per-IP) by design: at Chariot's webhook
+// volume a global limiter never touches legitimate traffic, and per-IP
+// tracking would add state and complexity for marginal benefit. Per-IP
+// enforcement is Cloud Armor's job — see
+// docs/security-and-network-options.md.
+func rateLimitMiddleware(limiter *rate.Limiter, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !limiter.Allow() {
+			http.Error(w, "too many requests", http.StatusTooManyRequests)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // handleWebhook receives Zoom webhook POSTs.

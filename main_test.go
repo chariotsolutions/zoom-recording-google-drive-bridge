@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 // ----------------------------------------------------------------------------
@@ -700,6 +702,94 @@ func TestSignForRoundtrip(t *testing.T) {
 	if !verifyZoomSignature(testSecret, ts, sig, body) {
 		t.Errorf("signFor produced a signature that verifyZoomSignature rejected:\n  ts=%s\n  sig=%s",
 			ts, sig)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Rate limiting middleware tests
+// ----------------------------------------------------------------------------
+
+func TestRateLimitMiddleware_AllowsUnderLimit(t *testing.T) {
+	// Burst of 5 with a high refill rate: all 5 back-to-back requests
+	// should pass through to the inner handler.
+	limiter := rate.NewLimiter(rate.Limit(100), 5)
+	called := 0
+	handler := rateLimitMiddleware(limiter, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called++
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	for i := 0; i < 5; i++ {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/webhook", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want 200", i+1, rec.Code)
+		}
+	}
+	if called != 5 {
+		t.Fatalf("inner handler called %d times, want 5", called)
+	}
+}
+
+func TestRateLimitMiddleware_RejectsOverLimit(t *testing.T) {
+	// Burst 2 with rate 1 rps: after 2 requests the bucket is empty and
+	// refills too slowly to affect the test.
+	limiter := rate.NewLimiter(rate.Limit(1), 2)
+	called := 0
+	handler := rateLimitMiddleware(limiter, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called++
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Exhaust the burst.
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/webhook", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("burst request %d: status = %d, want 200", i+1, rec.Code)
+		}
+	}
+
+	// Next request must be rejected, and the inner handler must NOT run.
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/webhook", nil))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("over-limit request: status = %d, want 429", rec.Code)
+	}
+	if called != 2 {
+		t.Fatalf("inner handler called %d times, want 2 (must not run on rejection)", called)
+	}
+}
+
+func TestRateLimitMiddleware_RefillsOverTime(t *testing.T) {
+	// 100 rps → one token every 10ms. Burst 1 keeps the bucket small so
+	// a short sleep is enough to observe refill without slowing the test.
+	limiter := rate.NewLimiter(rate.Limit(100), 1)
+	handler := rateLimitMiddleware(limiter, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// First request consumes the only token.
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/webhook", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first request: status = %d, want 200", rec.Code)
+	}
+
+	// Immediately after, the bucket is empty.
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/webhook", nil))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("immediate retry: status = %d, want 429", rec.Code)
+	}
+
+	// Wait long enough for the bucket to refill at least one token.
+	time.Sleep(50 * time.Millisecond)
+
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/webhook", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("after refill: status = %d, want 200", rec.Code)
 	}
 }
 

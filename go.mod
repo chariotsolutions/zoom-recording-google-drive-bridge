@@ -2,7 +2,10 @@ module github.com/chariotsolutions/zoom-recording-google-drive-bridge
 
 go 1.26.2
 
-require google.golang.org/api v0.275.0
+require (
+	golang.org/x/time v0.15.0
+	google.golang.org/api v0.275.0
+)
 
 require (
 	cloud.google.com/go/auth v0.20.0 // indirect

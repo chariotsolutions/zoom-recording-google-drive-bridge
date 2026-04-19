@@ -184,7 +184,8 @@ gcloud run deploy zoom-recording-bridge \
   --allow-unauthenticated \
   --service-account <YOUR_SERVICE_ACCOUNT> \
   --set-env-vars DRIVE_ROOT_FOLDER_ID=<YOUR_FOLDER_ID> \
-  --update-secrets ZOOM_WEBHOOK_SECRET_TOKEN=zoom-webhook-secret:latest
+  --update-secrets ZOOM_WEBHOOK_SECRET_TOKEN=zoom-webhook-secret:latest \
+  --max-instances=1
 ```
 
 Replace `<YOUR_FOLDER_ID>` with the Drive folder ID from the prerequisites
@@ -200,6 +201,7 @@ What each flag does:
 | `--service-account ...` | Runtime identity for the container (inherits Drive access) |
 | `--set-env-vars DRIVE_ROOT_FOLDER_ID=...` | Non-secret config as a plain env var |
 | `--update-secrets ZOOM_WEBHOOK_SECRET_TOKEN=...` | Mount the Secret Manager secret as that env var |
+| `--max-instances=1` | Cap horizontal scaling at one instance; the in-process per-meeting mutex is sufficient at Chariot's webhook volume |
 
 **First deploy takes 3-5 minutes.** You'll see progress for:
 
@@ -407,7 +409,8 @@ gcloud run deploy zoom-recording-bridge \
   --allow-unauthenticated \
   --service-account <YOUR_SERVICE_ACCOUNT> \
   --set-env-vars DRIVE_ROOT_FOLDER_ID=<YOUR_FOLDER_ID> \
-  --update-secrets ZOOM_WEBHOOK_SECRET_TOKEN=zoom-webhook-secret:latest
+  --update-secrets ZOOM_WEBHOOK_SECRET_TOKEN=zoom-webhook-secret:latest \
+  --max-instances=1
 ```
 
 Same command as the initial deploy. Cloud Run creates a new revision and
