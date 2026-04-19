@@ -7,19 +7,26 @@
 //  1. recording.completed → MP4 video, M4A audio, timeline.json
 //  2. recording.transcript_completed → VTT transcript
 //
-// Both events use the same meeting ID so they exercise the bridge's
-// per-meeting serialization lock.
+// The bridge enqueues these events to Cloud Tasks; a separate
+// /process-event invocation then does the actual download + upload.
+// For local development, the bridge can run in "in-process fake tasks"
+// mode (BRIDGE_IN_PROCESS_FAKE_TASKS=1) which short-circuits Cloud
+// Tasks by having the bridge call /process-event on itself — that's
+// what makes this synthetic driver work without Cloud Tasks infra.
 //
 // Usage:
 //
 //	export ZOOM_WEBHOOK_SECRET_TOKEN=test_secret_local
 //	export DRIVE_ROOT_FOLDER_ID=<your_drive_folder_id>
 //	export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+//	export PROCESS_EVENT_URL=http://localhost:8080/process-event
+//	export BRIDGE_IN_PROCESS_FAKE_TASKS=1
 //
 //	# Terminal 1: start the bridge
 //	go run .
 //
-//	# Terminal 2: run the synthetic test
+//	# Terminal 2: run the synthetic test (does not need PROCESS_EVENT_URL
+//	# or BRIDGE_IN_PROCESS_FAKE_TASKS — only the bridge process does)
 //	go run ./cmd/synthetic-test
 //
 // Flags:
@@ -27,9 +34,9 @@
 //	--bridge-url        URL of the bridge's webhook endpoint
 //	--topic             Meeting topic (default: "Synthetic Test <unix-time>")
 //	--reverse-order     Send transcript event BEFORE recording event (tests
-//	                    the per-meeting lock's handling of out-of-order
-//	                    delivery; Zoom does this ~7ms before recording.completed
-//	                    in some real observations)
+//	                    the queue's handling of out-of-order delivery; Zoom
+//	                    does this ~7ms before recording.completed in some
+//	                    real observations)
 //	--skip-verify       Just POST both events, skip Drive verification
 //	--poll-timeout      How long to poll Drive before giving up (default 60s)
 package main

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1256,5 +1257,75 @@ func TestLoadConfig_MissingTasksInvokerSA_ReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "TASKS_INVOKER_SA") {
 		t.Errorf("error = %q, want TASKS_INVOKER_SA mentioned", err.Error())
+	}
+}
+
+func TestLoadConfig_InProcessFakeMode_SkipsCloudTasksVars(t *testing.T) {
+	t.Setenv("ZOOM_WEBHOOK_SECRET_TOKEN", "x")
+	t.Setenv("DRIVE_ROOT_FOLDER_ID", "x")
+	t.Setenv("PROCESS_EVENT_URL", "x")
+	t.Setenv("CLOUD_TASKS_QUEUE", "")
+	t.Setenv("TASKS_INVOKER_SA", "")
+	t.Setenv("BRIDGE_IN_PROCESS_FAKE_TASKS", "1")
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if !cfg.InProcessFakeTasks {
+		t.Errorf("InProcessFakeTasks = false, want true")
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Tier 6: in-process fake enqueuer (test-only bypass)
+// ----------------------------------------------------------------------------
+
+// TestInProcessFakeEnqueuer_DispatchesToProcessEventURL verifies that
+// the in-process fake actually POSTs the serialized payload to the
+// configured URL with a non-empty Authorization header. This is the
+// seam the synthetic test driver relies on.
+func TestInProcessFakeEnqueuer_DispatchesToProcessEventURL(t *testing.T) {
+	received := make(chan []byte, 1)
+	gotAuth := make(chan string, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotAuth <- r.Header.Get("Authorization")
+		received <- body
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	enq := newInProcessFakeEnqueuer(target.URL)
+	payload := TaskPayload{EventName: "recording.completed", DownloadToken: "abc"}
+	if err := enq.Enqueue(context.Background(), payload); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	select {
+	case body := <-received:
+		var got TaskPayload
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatalf("unmarshal dispatched body: %v", err)
+		}
+		if got.EventName != "recording.completed" || got.DownloadToken != "abc" {
+			t.Errorf("dispatched payload = %+v, want EventName=recording.completed DownloadToken=abc", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for fake enqueuer dispatch")
+	}
+
+	if auth := <-gotAuth; !strings.HasPrefix(auth, "Bearer ") {
+		t.Errorf("Authorization header = %q, want 'Bearer ...'", auth)
+	}
+}
+
+func TestPassThroughTokenValidator_AcceptsAnything(t *testing.T) {
+	v := passThroughTokenValidator{}
+	if err := v.Validate(context.Background(), "", ""); err != nil {
+		t.Errorf("Validate with empty inputs should not error, got %v", err)
+	}
+	if err := v.Validate(context.Background(), "something", "something"); err != nil {
+		t.Errorf("Validate with values should not error, got %v", err)
 	}
 }

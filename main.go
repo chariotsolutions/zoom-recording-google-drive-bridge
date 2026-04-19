@@ -21,6 +21,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	cloudtasks "cloud.google.com/go/cloudtasks/apiv2"
@@ -75,16 +76,28 @@ type Config struct {
 	// /process-event dispatches. Typically the same service account
 	// the bridge runs as on Cloud Run. Loaded from TASKS_INVOKER_SA.
 	TasksInvokerSA string
+
+	// InProcessFakeTasks enables a test-only bypass of Cloud Tasks:
+	// the bridge constructs an inProcessFakeEnqueuer that directly
+	// POSTs task payloads to ProcessEventURL, and a
+	// passThroughTokenValidator that accepts any bearer token. This
+	// exists for the synthetic test driver to exercise the webhook →
+	// enqueue → /process-event → processRecording → Drive path
+	// end-to-end without needing a Cloud Tasks emulator or a real
+	// queue. Loaded from BRIDGE_IN_PROCESS_FAKE_TASKS (value "1").
+	// NEVER SET IN PRODUCTION — it disables OIDC verification.
+	InProcessFakeTasks bool
 }
 
 func loadConfig() (*Config, error) {
 	cfg := &Config{
-		ZoomWebhookSecret: os.Getenv("ZOOM_WEBHOOK_SECRET_TOKEN"),
-		DriveRootFolderID: os.Getenv("DRIVE_ROOT_FOLDER_ID"),
-		Port:              getEnvDefault("PORT", "8080"),
-		ProcessEventURL:   os.Getenv("PROCESS_EVENT_URL"),
-		CloudTasksQueue:   os.Getenv("CLOUD_TASKS_QUEUE"),
-		TasksInvokerSA:    os.Getenv("TASKS_INVOKER_SA"),
+		ZoomWebhookSecret:  os.Getenv("ZOOM_WEBHOOK_SECRET_TOKEN"),
+		DriveRootFolderID:  os.Getenv("DRIVE_ROOT_FOLDER_ID"),
+		Port:               getEnvDefault("PORT", "8080"),
+		ProcessEventURL:    os.Getenv("PROCESS_EVENT_URL"),
+		CloudTasksQueue:    os.Getenv("CLOUD_TASKS_QUEUE"),
+		TasksInvokerSA:     os.Getenv("TASKS_INVOKER_SA"),
+		InProcessFakeTasks: os.Getenv("BRIDGE_IN_PROCESS_FAKE_TASKS") == "1",
 	}
 
 	missing := []string{}
@@ -97,11 +110,16 @@ func loadConfig() (*Config, error) {
 	if cfg.ProcessEventURL == "" {
 		missing = append(missing, "PROCESS_EVENT_URL")
 	}
-	if cfg.CloudTasksQueue == "" {
-		missing = append(missing, "CLOUD_TASKS_QUEUE")
-	}
-	if cfg.TasksInvokerSA == "" {
-		missing = append(missing, "TASKS_INVOKER_SA")
+	// CLOUD_TASKS_QUEUE and TASKS_INVOKER_SA are only used by the
+	// production cloudTasksEnqueuer — not required in the in-process
+	// test mode.
+	if !cfg.InProcessFakeTasks {
+		if cfg.CloudTasksQueue == "" {
+			missing = append(missing, "CLOUD_TASKS_QUEUE")
+		}
+		if cfg.TasksInvokerSA == "" {
+			missing = append(missing, "TASKS_INVOKER_SA")
+		}
 	}
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required env vars: %s", strings.Join(missing, ", "))
@@ -274,6 +292,90 @@ func (e *cloudTasksEnqueuer) Enqueue(ctx context.Context, payload TaskPayload) e
 	return nil
 }
 
+// inProcessFakeEnqueuer is a TEST-ONLY TaskEnqueuer that short-circuits
+// Cloud Tasks by directly POSTing the task payload to processEventURL
+// in a goroutine. It exists so cmd/synthetic-test can exercise the full
+// webhook → enqueue → /process-event → processRecording → Drive path
+// end-to-end on a developer's laptop without needing Cloud Tasks infra
+// (which has no official Google emulator).
+//
+// A dispatch mutex serializes concurrent Enqueue calls, mimicking the
+// production queue's max-concurrent-dispatches=1 setting. Without this,
+// two webhook events arriving back-to-back would race on folder
+// creation inside processRecording and produce duplicate Drive
+// folders — the exact problem max-concurrent-dispatches=1 was chosen
+// to prevent.
+//
+// NEVER use in production: dispatch-in-goroutine re-introduces the
+// exact CPU-throttling / instance-reaping bug that motivated this
+// rearchitecture. Fine for local dev (no CPU throttling, no reaping),
+// catastrophic on Cloud Run. Gated behind BRIDGE_IN_PROCESS_FAKE_TASKS=1.
+type inProcessFakeEnqueuer struct {
+	dispatchMu      sync.Mutex // serializes dispatches; mimics max-concurrent-dispatches=1
+	processEventURL string
+	client          *http.Client
+}
+
+func newInProcessFakeEnqueuer(processEventURL string) *inProcessFakeEnqueuer {
+	return &inProcessFakeEnqueuer{
+		processEventURL: processEventURL,
+		// Generous timeout — the dispatched handler does real work
+		// (download + upload) and must not be prematurely canceled.
+		client: &http.Client{Timeout: 30 * time.Minute},
+	}
+}
+
+func (e *inProcessFakeEnqueuer) Enqueue(_ context.Context, payload TaskPayload) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal task payload: %w", err)
+	}
+
+	// Dispatch in a goroutine so Enqueue returns immediately, matching
+	// Cloud Tasks' fire-and-forget semantics. Use context.Background()
+	// so the dispatch outlives the original webhook request.
+	go func() {
+		// Serialize dispatches to one at a time, mimicking
+		// max-concurrent-dispatches=1 on the production queue.
+		e.dispatchMu.Lock()
+		defer e.dispatchMu.Unlock()
+
+		dispatchCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(dispatchCtx, http.MethodPost, e.processEventURL, bytes.NewReader(body))
+		if err != nil {
+			log.Printf("inProcessFakeEnqueuer: build request: %v", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		// Real Cloud Tasks attaches a Google-signed OIDC token here.
+		// The bridge's passThroughTokenValidator (also test-only)
+		// accepts any non-empty bearer.
+		req.Header.Set("Authorization", "Bearer fake-test-mode-token")
+
+		resp, err := e.client.Do(req)
+		if err != nil {
+			log.Printf("inProcessFakeEnqueuer: dispatch to %s: %v", e.processEventURL, err)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			log.Printf("inProcessFakeEnqueuer: /process-event returned %d", resp.StatusCode)
+		}
+	}()
+	return nil
+}
+
+// passThroughTokenValidator is a TEST-ONLY TokenValidator that accepts
+// any bearer token unconditionally. Paired with inProcessFakeEnqueuer
+// behind BRIDGE_IN_PROCESS_FAKE_TASKS=1. NEVER use in production.
+type passThroughTokenValidator struct{}
+
+func (passThroughTokenValidator) Validate(_ context.Context, _ string, _ string) error {
+	return nil
+}
+
 // ----------------------------------------------------------------------------
 // Server
 // ----------------------------------------------------------------------------
@@ -306,13 +408,25 @@ func main() {
 
 	ctx := context.Background()
 
-	validator, err := newIDTokenValidator(ctx)
-	if err != nil {
-		log.Fatalf("create id token validator: %v", err)
-	}
-	enqueuer, err := newCloudTasksEnqueuer(ctx, cfg)
-	if err != nil {
-		log.Fatalf("create cloud tasks enqueuer: %v", err)
+	var (
+		validator TokenValidator
+		enqueuer  TaskEnqueuer
+	)
+	if cfg.InProcessFakeTasks {
+		log.Println("⚠️  BRIDGE_IN_PROCESS_FAKE_TASKS=1: using in-process fake Cloud Tasks + pass-through OIDC validator — TEST USE ONLY, DO NOT DEPLOY")
+		enqueuer = newInProcessFakeEnqueuer(cfg.ProcessEventURL)
+		validator = passThroughTokenValidator{}
+	} else {
+		v, err := newIDTokenValidator(ctx)
+		if err != nil {
+			log.Fatalf("create id token validator: %v", err)
+		}
+		e, err := newCloudTasksEnqueuer(ctx, cfg)
+		if err != nil {
+			log.Fatalf("create cloud tasks enqueuer: %v", err)
+		}
+		validator = v
+		enqueuer = e
 	}
 
 	srv := &Server{
