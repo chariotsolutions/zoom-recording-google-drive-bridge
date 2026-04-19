@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -940,5 +941,190 @@ func TestFakeTokenValidator_ReturnsConfiguredError(t *testing.T) {
 	err := f.Validate(context.Background(), "x", "y")
 	if !errors.Is(err, want) {
 		t.Fatalf("err = %v, want %v", err, want)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Tier 4: /process-event handler tests
+// ----------------------------------------------------------------------------
+
+// newProcessEventTestServer builds a Server suitable for handleProcessEvent
+// tests — pre-wired with accepting fakes. Tests override fields to
+// exercise specific paths.
+func newProcessEventTestServer() *Server {
+	srv := &Server{
+		cfg:            &Config{ProcessEventURL: "http://test.invalid/process-event"},
+		tokenValidator: &fakeTokenValidator{}, // accept by default
+	}
+	srv.processEventFn = func(ctx context.Context, meeting ZoomMeeting, downloadToken string, writeMetadata bool) error {
+		return nil
+	}
+	return srv
+}
+
+func postProcessEvent(t *testing.T, srv *Server, body []byte, authHeader string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/process-event", bytes.NewReader(body))
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
+	rec := httptest.NewRecorder()
+	srv.handleProcessEvent(rec, req)
+	return rec
+}
+
+func mustMarshalTask(t *testing.T, p TaskPayload) []byte {
+	t.Helper()
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal TaskPayload: %v", err)
+	}
+	return b
+}
+
+func TestHandleProcessEvent_MissingAuthorization_Returns401(t *testing.T) {
+	srv := newProcessEventTestServer()
+	body := mustMarshalTask(t, TaskPayload{EventName: "recording.completed"})
+	rec := postProcessEvent(t, srv, body, "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body = %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleProcessEvent_MalformedAuthorization_Returns401(t *testing.T) {
+	srv := newProcessEventTestServer()
+	body := mustMarshalTask(t, TaskPayload{EventName: "recording.completed"})
+	// Not "Bearer <token>"
+	rec := postProcessEvent(t, srv, body, "Basic abc123")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestHandleProcessEvent_InvalidOIDCToken_Returns401(t *testing.T) {
+	srv := newProcessEventTestServer()
+	srv.tokenValidator = &fakeTokenValidator{returnErr: errors.New("invalid audience")}
+	body := mustMarshalTask(t, TaskPayload{EventName: "recording.completed"})
+	rec := postProcessEvent(t, srv, body, "Bearer fake-token")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestHandleProcessEvent_PassesAudienceToValidator(t *testing.T) {
+	srv := newProcessEventTestServer()
+	fake := &fakeTokenValidator{}
+	srv.tokenValidator = fake
+	body := mustMarshalTask(t, TaskPayload{EventName: "recording.completed"})
+	postProcessEvent(t, srv, body, "Bearer tok-xyz")
+	if fake.lastToken != "tok-xyz" {
+		t.Errorf("validator got token = %q, want tok-xyz", fake.lastToken)
+	}
+	if fake.lastAudience != "http://test.invalid/process-event" {
+		t.Errorf("validator got audience = %q, want the configured ProcessEventURL", fake.lastAudience)
+	}
+}
+
+func TestHandleProcessEvent_MalformedJSON_Returns400(t *testing.T) {
+	srv := newProcessEventTestServer()
+	rec := postProcessEvent(t, srv, []byte("{not-json"), "Bearer xyz")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHandleProcessEvent_ValidTask_InvokesProcessEventFn(t *testing.T) {
+	srv := newProcessEventTestServer()
+
+	var (
+		called     int
+		gotMeeting ZoomMeeting
+		gotToken   string
+		gotWriteMd bool
+	)
+	srv.processEventFn = func(ctx context.Context, meeting ZoomMeeting, downloadToken string, writeMetadata bool) error {
+		called++
+		gotMeeting = meeting
+		gotToken = downloadToken
+		gotWriteMd = writeMetadata
+		return nil
+	}
+
+	payload := TaskPayload{
+		EventName:     "recording.completed",
+		Meeting:       ZoomMeeting{ID: 42, Topic: "Hi", HostEmail: "h@c.com"},
+		DownloadToken: "tok-abc",
+		WriteMetadata: true,
+	}
+	body := mustMarshalTask(t, payload)
+	rec := postProcessEvent(t, srv, body, "Bearer xyz")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %q", rec.Code, rec.Body.String())
+	}
+	if called != 1 {
+		t.Fatalf("processEventFn called %d times, want 1", called)
+	}
+	if gotMeeting.ID != 42 || gotMeeting.Topic != "Hi" {
+		t.Errorf("meeting = %+v, want ID=42 Topic=Hi", gotMeeting)
+	}
+	if gotToken != "tok-abc" {
+		t.Errorf("downloadToken = %q, want tok-abc", gotToken)
+	}
+	if !gotWriteMd {
+		t.Errorf("writeMetadata = false, want true")
+	}
+}
+
+func TestHandleProcessEvent_ZoomUnauthorized_Returns410Permanent(t *testing.T) {
+	srv := newProcessEventTestServer()
+	srv.processEventFn = func(ctx context.Context, meeting ZoomMeeting, downloadToken string, writeMetadata bool) error {
+		return fmt.Errorf("stream someFile: %w", errZoomUnauthorized)
+	}
+	body := mustMarshalTask(t, TaskPayload{EventName: "recording.completed", Meeting: ZoomMeeting{ID: 1}})
+	rec := postProcessEvent(t, srv, body, "Bearer xyz")
+	if rec.Code != http.StatusGone {
+		t.Fatalf("status = %d, want 410 (permanent, no retry); body = %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleProcessEvent_ProcessorError_Returns500Retryable(t *testing.T) {
+	srv := newProcessEventTestServer()
+	srv.processEventFn = func(ctx context.Context, meeting ZoomMeeting, downloadToken string, writeMetadata bool) error {
+		return errors.New("transient drive API error")
+	}
+	body := mustMarshalTask(t, TaskPayload{EventName: "recording.completed", Meeting: ZoomMeeting{ID: 1}})
+	rec := postProcessEvent(t, srv, body, "Bearer xyz")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body = %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleProcessEvent_MethodNotAllowed_OnGET(t *testing.T) {
+	srv := newProcessEventTestServer()
+	req := httptest.NewRequest(http.MethodGet, "/process-event", nil)
+	rec := httptest.NewRecorder()
+	srv.handleProcessEvent(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", rec.Code)
+	}
+}
+
+// TestStreamFileToDrive_Zoom401 confirms that a 401 from Zoom's
+// download endpoint surfaces as the errZoomUnauthorized sentinel.
+// processRecording relies on this to short-circuit the loop and return
+// a permanent-failure error up to handleProcessEvent.
+func TestStreamFileToDrive_Zoom401_ReturnsErrZoomUnauthorized(t *testing.T) {
+	zoom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer zoom.Close()
+
+	srv := &Server{cfg: &Config{}}
+	file := RecordingFile{DownloadURL: zoom.URL}
+	// driveSvc is nil — the 401 check aborts before Drive is touched.
+	err := srv.streamFileToDrive(context.Background(), nil, file, "some-token", "parent", "filename.mp4")
+	if !errors.Is(err, errZoomUnauthorized) {
+		t.Fatalf("err = %v, want wrapped errZoomUnauthorized", err)
 	}
 }
