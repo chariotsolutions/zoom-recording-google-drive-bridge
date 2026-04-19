@@ -81,6 +81,20 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --role=roles/cloudtasks.enqueuer
 
 echo ""
+echo "-- granting roles/iam.serviceAccountUser on $SERVICE_ACCOUNT to itself --"
+# When creating a Cloud Tasks task with OidcToken.ServiceAccountEmail,
+# the caller (i.e. the bridge) needs iam.serviceAccounts.actAs on the
+# SA named in OidcToken. We use the bridge's own SA as the OIDC
+# principal, so the binding is self-referential: the SA gets
+# serviceAccountUser on itself. Without this, task creation fails with
+# PERMISSION_DENIED on every webhook.
+# Ref: https://cloud.google.com/tasks/docs/reference/rest/v2/OidcToken
+gcloud iam service-accounts add-iam-policy-binding "$SERVICE_ACCOUNT" \
+  --project="$PROJECT_ID" \
+  --member="serviceAccount:$SERVICE_ACCOUNT" \
+  --role=roles/iam.serviceAccountUser
+
+echo ""
 # run.invoker binding and --timeout=1800 both need the Cloud Run service
 # to already exist. On a first-time deploy it doesn't — skip those here
 # and re-run the script after the first `gcloud run deploy`.
