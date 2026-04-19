@@ -1128,3 +1128,39 @@ func TestStreamFileToDrive_Zoom401_ReturnsErrZoomUnauthorized(t *testing.T) {
 		t.Fatalf("err = %v, want wrapped errZoomUnauthorized", err)
 	}
 }
+
+// ----------------------------------------------------------------------------
+// Tier 5: loadConfig
+// ----------------------------------------------------------------------------
+
+func TestLoadConfig_MissingProcessEventURL_ReturnsError(t *testing.T) {
+	t.Setenv("ZOOM_WEBHOOK_SECRET_TOKEN", "x")
+	t.Setenv("DRIVE_ROOT_FOLDER_ID", "x")
+	t.Setenv("PROCESS_EVENT_URL", "")
+	_, err := loadConfig()
+	if err == nil {
+		t.Fatal("loadConfig returned nil error when PROCESS_EVENT_URL is missing")
+	}
+	if !strings.Contains(err.Error(), "PROCESS_EVENT_URL") {
+		t.Errorf("error = %q, want it to mention PROCESS_EVENT_URL", err.Error())
+	}
+}
+
+func TestLoadConfig_AllRequiredPresent_Succeeds(t *testing.T) {
+	t.Setenv("ZOOM_WEBHOOK_SECRET_TOKEN", "secret")
+	t.Setenv("DRIVE_ROOT_FOLDER_ID", "folder")
+	t.Setenv("PROCESS_EVENT_URL", "https://example.run.app/process-event")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.ProcessEventURL != "https://example.run.app/process-event" {
+		t.Errorf("ProcessEventURL = %q, want the set value", cfg.ProcessEventURL)
+	}
+	if cfg.ZoomWebhookSecret != "secret" {
+		t.Errorf("ZoomWebhookSecret = %q, want %q", cfg.ZoomWebhookSecret, "secret")
+	}
+	if cfg.DriveRootFolderID != "folder" {
+		t.Errorf("DriveRootFolderID = %q, want %q", cfg.DriveRootFolderID, "folder")
+	}
+}
