@@ -738,21 +738,6 @@ func TestHandleWebhook_TranscriptUnsignedRejected(t *testing.T) {
 	}
 }
 
-func TestMeetingLockSerializesSameMeeting(t *testing.T) {
-	srv := newTestServer()
-	// Same meeting ID → same mutex
-	lock1 := srv.meetingLock(42)
-	lock2 := srv.meetingLock(42)
-	if lock1 != lock2 {
-		t.Errorf("expected same mutex for same meeting ID")
-	}
-	// Different meeting ID → different mutex
-	lock3 := srv.meetingLock(43)
-	if lock1 == lock3 {
-		t.Errorf("expected different mutex for different meeting ID")
-	}
-}
-
 func TestHandleWebhook_UnknownEvent(t *testing.T) {
 	srv := newTestServer()
 	body := []byte(`{"event":"meeting.started","payload":{}}`)

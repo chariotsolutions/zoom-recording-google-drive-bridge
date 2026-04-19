@@ -21,7 +21,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	cloudtasks "cloud.google.com/go/cloudtasks/apiv2"
@@ -297,22 +296,6 @@ type Server struct {
 	// rather than a method keeps the test seam small without
 	// introducing a whole-processor interface.
 	processEventFn func(ctx context.Context, meeting ZoomMeeting, downloadToken string, writeMetadata bool) error
-
-	// meetingLocks serializes processRecording calls that share the same
-	// meeting ID. Removed in a later commit once Cloud Tasks'
-	// max-concurrent-dispatches=1 provides the same guarantee at the
-	// queue layer (see issue #8).
-	//
-	// See docs/design-decisions.md "Decision 1" for the alternatives we
-	// considered and why we landed on this approach.
-	meetingLocks sync.Map
-}
-
-// meetingLock returns the mutex for a given meeting ID, creating one on
-// first use. Safe for concurrent use.
-func (s *Server) meetingLock(meetingID int64) *sync.Mutex {
-	m, _ := s.meetingLocks.LoadOrStore(meetingID, &sync.Mutex{})
-	return m.(*sync.Mutex)
 }
 
 func main() {
@@ -617,13 +600,10 @@ func verifyZoomSignature(secret, timestamp, signatureHeader string, body []byte)
 // ----------------------------------------------------------------------------
 
 func (s *Server) processRecording(ctx context.Context, meeting ZoomMeeting, downloadToken string, writeMetadata bool) error {
-	// Serialize concurrent processRecording calls for the same meeting.
-	// This closes the race window between recording.completed and
-	// recording.transcript_completed, which Zoom may deliver within
-	// milliseconds of each other (or even out of order).
-	lock := s.meetingLock(meeting.ID)
-	lock.Lock()
-	defer lock.Unlock()
+	// Per-event serialization is now provided by Cloud Tasks'
+	// max-concurrent-dispatches=1 on the queue — the in-process
+	// meetingLocks mutex was removed when the goroutine pattern was
+	// retired (see issue #8).
 
 	log.Printf("processing recording: topic=%q meetingID=%d host=%s files=%d writeMetadata=%v",
 		meeting.Topic, meeting.ID, meeting.HostEmail, len(meeting.RecordingFiles), writeMetadata)
