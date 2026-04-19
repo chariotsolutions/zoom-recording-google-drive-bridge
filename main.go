@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -27,6 +28,14 @@ import (
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/option"
 )
+
+// errZoomUnauthorized indicates Zoom rejected the per-event download_token
+// when fetching a recording file (HTTP 401). This is treated as a permanent
+// failure by handleProcessEvent — retrying with the same download_token will
+// fail the same way, and the token itself can't be refreshed (Zoom issues a
+// new one with each webhook event). Zoom documents the token as valid for
+// ~24 hours.
+var errZoomUnauthorized = errors.New("zoom rejected download_token (HTTP 401)")
 
 // rateLimitRPS and rateLimitBurst are the global token-bucket parameters
 // for /webhook. Both are well above legitimate Zoom traffic (events
@@ -45,6 +54,13 @@ type Config struct {
 	ZoomWebhookSecret string
 	DriveRootFolderID string
 	Port              string
+
+	// ProcessEventURL is the public URL Cloud Tasks calls to dispatch a
+	// task to /process-event. Used as the OIDC audience claim that
+	// /process-event's TokenValidator verifies, and as the target URL
+	// on enqueued tasks. Optional in loadConfig for now; becomes
+	// required once Cloud Tasks is wired (see issue #8).
+	ProcessEventURL string
 }
 
 func loadConfig() (*Config, error) {
@@ -159,17 +175,21 @@ type TokenValidator interface {
 type Server struct {
 	cfg *Config
 
+	// tokenValidator verifies OIDC bearer tokens on /process-event
+	// requests. Nil until wired in main() (production) or a test.
+	tokenValidator TokenValidator
+
+	// processEventFn is the per-event work function invoked by
+	// handleProcessEvent. Defaults to (*Server).processRecording in
+	// production; tests substitute a stub. Using a function field
+	// rather than a method keeps the test seam small without
+	// introducing a whole-processor interface.
+	processEventFn func(ctx context.Context, meeting ZoomMeeting, downloadToken string, writeMetadata bool) error
+
 	// meetingLocks serializes processRecording calls that share the same
-	// meeting ID. This prevents a race between recording.completed and
-	// recording.transcript_completed when they arrive within milliseconds
-	// of each other — without serialization, both goroutines can call
-	// getOrCreateFolder concurrently and create duplicate "meeting folder"
-	// entries because Drive does not enforce name uniqueness within a
-	// parent folder.
-	//
-	// Keyed by meeting ID (int64) → *sync.Mutex. Entries are never cleaned
-	// up; Cloud Run instance lifetime is short enough that unbounded growth
-	// is not a real concern.
+	// meeting ID. Removed in a later commit once Cloud Tasks'
+	// max-concurrent-dispatches=1 provides the same guarantee at the
+	// queue layer (see issue #8).
 	//
 	// See docs/design-decisions.md "Decision 1" for the alternatives we
 	// considered and why we landed on this approach.
@@ -350,6 +370,94 @@ func (s *Server) handleValidation(w http.ResponseWriter, raw json.RawMessage) {
 }
 
 // ----------------------------------------------------------------------------
+// /process-event: Cloud Tasks callback
+// ----------------------------------------------------------------------------
+
+// extractBearerToken pulls the token out of an Authorization: Bearer <token>
+// header. Returns an error if the header is missing or malformed.
+func extractBearerToken(r *http.Request) (string, error) {
+	h := r.Header.Get("Authorization")
+	if h == "" {
+		return "", errors.New("missing Authorization header")
+	}
+	parts := strings.SplitN(h, " ", 2)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" {
+		return "", errors.New("malformed Authorization header (expected 'Bearer <token>')")
+	}
+	return parts[1], nil
+}
+
+// handleProcessEvent is invoked by Cloud Tasks with a TaskPayload body
+// and an OIDC bearer token in the Authorization header. It verifies the
+// token, parses the payload, and runs the per-event work synchronously
+// inside the request lifecycle (so Cloud Run keeps full CPU allocated
+// for the duration — the whole point of the rearchitecture).
+//
+// Response status codes communicate retry semantics back to Cloud Tasks:
+//   - 200 — task succeeded, no retry
+//   - 400 — malformed request body (will not retry on 4xx by default)
+//   - 401 — missing / invalid OIDC (will not retry on 4xx by default)
+//   - 410 — Zoom rejected the download_token (permanent; do not retry)
+//   - 500 — other processing error (Cloud Tasks retries per queue config)
+//
+// Cloud Tasks default retry policy retries 5xx and network errors; 4xx
+// responses (except 408/429) are treated as permanent failures.
+func (s *Server) handleProcessEvent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	token, err := extractBearerToken(r)
+	if err != nil {
+		log.Printf("process-event: %v", err)
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	if err := s.tokenValidator.Validate(r.Context(), token, s.cfg.ProcessEventURL); err != nil {
+		log.Printf("process-event token validation failed: %v", err)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Cap the body at 1 MB. Real task payloads are a few KB; 1 MB is
+	// generous and matches the cap on /webhook.
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, "failed to read body", http.StatusBadRequest)
+		return
+	}
+	var payload TaskPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		log.Printf("process-event: invalid task payload: %v", err)
+		http.Error(w, "invalid task payload", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("process-event: starting event=%s meetingID=%d files=%d writeMetadata=%v",
+		payload.EventName, payload.Meeting.ID, len(payload.Meeting.RecordingFiles), payload.WriteMetadata)
+
+	err = s.processEventFn(r.Context(), payload.Meeting, payload.DownloadToken, payload.WriteMetadata)
+	if err != nil {
+		if errors.Is(err, errZoomUnauthorized) {
+			// Permanent failure — the download_token is no longer
+			// valid and retries can't recover it.
+			log.Printf("process-event: permanent failure event=%s meetingID=%d: %v",
+				payload.EventName, payload.Meeting.ID, err)
+			http.Error(w, "zoom download_token rejected (permanent)", http.StatusGone)
+			return
+		}
+		log.Printf("process-event: transient failure event=%s meetingID=%d: %v",
+			payload.EventName, payload.Meeting.ID, err)
+		http.Error(w, "processing failed", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintln(w, "OK")
+}
+
+// ----------------------------------------------------------------------------
 // Signature verification
 // ----------------------------------------------------------------------------
 
@@ -425,6 +533,15 @@ func (s *Server) processRecording(ctx context.Context, meeting ZoomMeeting, down
 		}
 		filename := buildFilename(meeting.Topic, file)
 		if err := s.streamFileToDrive(ctx, driveSvc, file, downloadToken, rawFolderID, filename); err != nil {
+			// Zoom 401 means the download_token is invalid (expired,
+			// revoked, or wrong). All remaining files in this event
+			// will fail the same way, and retries will fail the same
+			// way. Return the sentinel so handleProcessEvent can
+			// translate it to a permanent-failure response to Cloud
+			// Tasks.
+			if errors.Is(err, errZoomUnauthorized) {
+				return fmt.Errorf("stream %s: %w", filename, err)
+			}
 			log.Printf("stream %s failed: %v", filename, err)
 			continue
 		}
@@ -497,6 +614,9 @@ func (s *Server) streamFileToDrive(
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusUnauthorized {
+			return fmt.Errorf("%s: %w", filename, errZoomUnauthorized)
+		}
 		return fmt.Errorf("download status %d", resp.StatusCode)
 	}
 
