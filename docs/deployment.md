@@ -196,6 +196,11 @@ This creates:
   download_token expiry).
 - IAM binding: service account gets `roles/cloudtasks.enqueuer` (the
   bridge creates tasks from `/webhook`).
+- IAM binding: service account gets `roles/iam.serviceAccountUser` on
+  itself. When the bridge creates a task whose `OidcToken` names its
+  own service account, Cloud Tasks requires the caller to have
+  `iam.serviceAccounts.actAs` on the SA — even when it's the same SA.
+  Without this, every webhook enqueue fails with `PERMISSION_DENIED`.
 - IAM binding: service account gets `roles/run.invoker` on the Cloud
   Run service (Cloud Tasks, signing as this SA, invokes
   `/process-event`).
