@@ -502,6 +502,9 @@ func newTestServer() *Server {
 			ZoomWebhookSecret: testSecret,
 			// Other fields are not exercised by these tests
 		},
+		// Default to an accepting, capturing fake. Tests that care
+		// about enqueue behavior replace this with their own fake.
+		taskEnqueuer: &fakeTaskEnqueuer{},
 	}
 }
 
@@ -654,6 +657,73 @@ func TestHandleWebhook_TranscriptCompleted(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleWebhook_SignedRecording_EnqueuesTask(t *testing.T) {
+	srv := newTestServer()
+	fakeEnq := &fakeTaskEnqueuer{}
+	srv.taskEnqueuer = fakeEnq
+
+	body := []byte(`{"event":"recording.completed","download_token":"tok-abc","payload":{"object":{"id":42,"topic":"Test Meeting","host_email":"h@c.com","recording_files":[{"id":"f1","status":"completed","file_type":"MP4","download_url":"http://zoom/f1"}]}}}`)
+	now := strconv.FormatInt(time.Now().Unix(), 10)
+
+	rec := postWebhook(t, srv, body, true, now)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if len(fakeEnq.enqueued) != 1 {
+		t.Fatalf("enqueued = %d, want exactly 1 task", len(fakeEnq.enqueued))
+	}
+	p := fakeEnq.enqueued[0]
+	if p.EventName != "recording.completed" {
+		t.Errorf("EventName = %q, want %q", p.EventName, "recording.completed")
+	}
+	if p.DownloadToken != "tok-abc" {
+		t.Errorf("DownloadToken = %q, want %q", p.DownloadToken, "tok-abc")
+	}
+	if p.Meeting.ID != 42 {
+		t.Errorf("Meeting.ID = %d, want 42", p.Meeting.ID)
+	}
+	if !p.WriteMetadata {
+		t.Errorf("WriteMetadata = false, want true for recording.completed")
+	}
+}
+
+func TestHandleWebhook_SignedTranscript_EnqueuesTaskWithoutWriteMetadata(t *testing.T) {
+	srv := newTestServer()
+	fakeEnq := &fakeTaskEnqueuer{}
+	srv.taskEnqueuer = fakeEnq
+
+	body := []byte(`{"event":"recording.transcript_completed","download_token":"tok-xyz","payload":{"object":{"id":42,"topic":"t","recording_files":[{"id":"t1","status":"completed","file_type":"TRANSCRIPT","download_url":"http://zoom/t1"}]}}}`)
+	now := strconv.FormatInt(time.Now().Unix(), 10)
+
+	rec := postWebhook(t, srv, body, true, now)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if len(fakeEnq.enqueued) != 1 {
+		t.Fatalf("enqueued = %d, want 1", len(fakeEnq.enqueued))
+	}
+	p := fakeEnq.enqueued[0]
+	if p.EventName != "recording.transcript_completed" {
+		t.Errorf("EventName = %q, want %q", p.EventName, "recording.transcript_completed")
+	}
+	if p.WriteMetadata {
+		t.Errorf("WriteMetadata = true, want false for transcript event")
+	}
+}
+
+func TestHandleWebhook_EnqueueFailure_Returns500(t *testing.T) {
+	srv := newTestServer()
+	srv.taskEnqueuer = &fakeTaskEnqueuer{returnErr: errors.New("cloud tasks unavailable")}
+
+	body := []byte(`{"event":"recording.completed","download_token":"tok","payload":{"object":{"id":42,"topic":"t","recording_files":[]}}}`)
+	now := strconv.FormatInt(time.Now().Unix(), 10)
+
+	rec := postWebhook(t, srv, body, true, now)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (so Zoom retries); body=%q", rec.Code, rec.Body.String())
 	}
 }
 
@@ -1150,17 +1220,56 @@ func TestLoadConfig_AllRequiredPresent_Succeeds(t *testing.T) {
 	t.Setenv("ZOOM_WEBHOOK_SECRET_TOKEN", "secret")
 	t.Setenv("DRIVE_ROOT_FOLDER_ID", "folder")
 	t.Setenv("PROCESS_EVENT_URL", "https://example.run.app/process-event")
+	t.Setenv("CLOUD_TASKS_QUEUE", "projects/p/locations/l/queues/q")
+	t.Setenv("TASKS_INVOKER_SA", "bot@p.iam.gserviceaccount.com")
+
 	cfg, err := loadConfig()
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
 	if cfg.ProcessEventURL != "https://example.run.app/process-event" {
-		t.Errorf("ProcessEventURL = %q, want the set value", cfg.ProcessEventURL)
+		t.Errorf("ProcessEventURL = %q", cfg.ProcessEventURL)
+	}
+	if cfg.CloudTasksQueue != "projects/p/locations/l/queues/q" {
+		t.Errorf("CloudTasksQueue = %q", cfg.CloudTasksQueue)
+	}
+	if cfg.TasksInvokerSA != "bot@p.iam.gserviceaccount.com" {
+		t.Errorf("TasksInvokerSA = %q", cfg.TasksInvokerSA)
 	}
 	if cfg.ZoomWebhookSecret != "secret" {
 		t.Errorf("ZoomWebhookSecret = %q, want %q", cfg.ZoomWebhookSecret, "secret")
 	}
 	if cfg.DriveRootFolderID != "folder" {
 		t.Errorf("DriveRootFolderID = %q, want %q", cfg.DriveRootFolderID, "folder")
+	}
+}
+
+func TestLoadConfig_MissingCloudTasksQueue_ReturnsError(t *testing.T) {
+	t.Setenv("ZOOM_WEBHOOK_SECRET_TOKEN", "x")
+	t.Setenv("DRIVE_ROOT_FOLDER_ID", "x")
+	t.Setenv("PROCESS_EVENT_URL", "x")
+	t.Setenv("CLOUD_TASKS_QUEUE", "")
+	t.Setenv("TASKS_INVOKER_SA", "x")
+	_, err := loadConfig()
+	if err == nil {
+		t.Fatal("loadConfig returned nil error when CLOUD_TASKS_QUEUE missing")
+	}
+	if !strings.Contains(err.Error(), "CLOUD_TASKS_QUEUE") {
+		t.Errorf("error = %q, want CLOUD_TASKS_QUEUE mentioned", err.Error())
+	}
+}
+
+func TestLoadConfig_MissingTasksInvokerSA_ReturnsError(t *testing.T) {
+	t.Setenv("ZOOM_WEBHOOK_SECRET_TOKEN", "x")
+	t.Setenv("DRIVE_ROOT_FOLDER_ID", "x")
+	t.Setenv("PROCESS_EVENT_URL", "x")
+	t.Setenv("CLOUD_TASKS_QUEUE", "x")
+	t.Setenv("TASKS_INVOKER_SA", "")
+	_, err := loadConfig()
+	if err == nil {
+		t.Fatal("loadConfig returned nil error when TASKS_INVOKER_SA missing")
+	}
+	if !strings.Contains(err.Error(), "TASKS_INVOKER_SA") {
+		t.Errorf("error = %q, want TASKS_INVOKER_SA mentioned", err.Error())
 	}
 }

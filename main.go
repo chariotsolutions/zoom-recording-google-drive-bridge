@@ -24,10 +24,13 @@ import (
 	"sync"
 	"time"
 
+	cloudtasks "cloud.google.com/go/cloudtasks/apiv2"
+	taskspb "cloud.google.com/go/cloudtasks/apiv2/cloudtaskspb"
 	"golang.org/x/time/rate"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/idtoken"
 	"google.golang.org/api/option"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 // errZoomUnauthorized indicates Zoom rejected the per-event download_token
@@ -59,9 +62,20 @@ type Config struct {
 	// ProcessEventURL is the public URL Cloud Tasks calls to dispatch a
 	// task to /process-event. Used as the OIDC audience claim that
 	// /process-event's TokenValidator verifies, and as the target URL
-	// on enqueued tasks. Optional in loadConfig for now; becomes
-	// required once Cloud Tasks is wired (see issue #8).
+	// on enqueued tasks.
 	ProcessEventURL string
+
+	// CloudTasksQueue is the full resource name of the Cloud Tasks
+	// queue to enqueue into, e.g.
+	// projects/PROJECT/locations/REGION/queues/QUEUE_NAME. Loaded from
+	// CLOUD_TASKS_QUEUE env var.
+	CloudTasksQueue string
+
+	// TasksInvokerSA is the email of the service account that Cloud
+	// Tasks impersonates when signing OIDC bearer tokens for
+	// /process-event dispatches. Typically the same service account
+	// the bridge runs as on Cloud Run. Loaded from TASKS_INVOKER_SA.
+	TasksInvokerSA string
 }
 
 func loadConfig() (*Config, error) {
@@ -70,6 +84,8 @@ func loadConfig() (*Config, error) {
 		DriveRootFolderID: os.Getenv("DRIVE_ROOT_FOLDER_ID"),
 		Port:              getEnvDefault("PORT", "8080"),
 		ProcessEventURL:   os.Getenv("PROCESS_EVENT_URL"),
+		CloudTasksQueue:   os.Getenv("CLOUD_TASKS_QUEUE"),
+		TasksInvokerSA:    os.Getenv("TASKS_INVOKER_SA"),
 	}
 
 	missing := []string{}
@@ -81,6 +97,12 @@ func loadConfig() (*Config, error) {
 	}
 	if cfg.ProcessEventURL == "" {
 		missing = append(missing, "PROCESS_EVENT_URL")
+	}
+	if cfg.CloudTasksQueue == "" {
+		missing = append(missing, "CLOUD_TASKS_QUEUE")
+	}
+	if cfg.TasksInvokerSA == "" {
+		missing = append(missing, "TASKS_INVOKER_SA")
 	}
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required env vars: %s", strings.Join(missing, ", "))
@@ -166,9 +188,10 @@ type TaskEnqueuer interface {
 
 // TokenValidator abstracts OIDC bearer token verification so
 // handleProcessEvent can be tested without real Google-signed tokens.
-// Production uses a google.golang.org/api/idtoken-backed implementation;
-// the synthetic test driver (running against the Cloud Tasks emulator,
-// which does not sign OIDC tokens) uses a fake pass-through validator.
+// Production uses a google.golang.org/api/idtoken-backed implementation
+// (idtokenValidator below); the synthetic test driver (running against
+// the Cloud Tasks emulator, which does not sign OIDC tokens) uses a
+// fake pass-through validator.
 type TokenValidator interface {
 	Validate(ctx context.Context, token string, audience string) error
 }
@@ -195,12 +218,74 @@ func (v *idtokenValidator) Validate(ctx context.Context, token string, audience 
 	return err
 }
 
+// cloudTasksEnqueuer is the production TaskEnqueuer. It creates tasks
+// on a specific queue that Cloud Tasks will dispatch to
+// cfg.ProcessEventURL with an OIDC token signed for
+// cfg.TasksInvokerSA.
+type cloudTasksEnqueuer struct {
+	client           *cloudtasks.Client
+	queuePath        string
+	processEventURL  string
+	invokerSA        string
+	dispatchDeadline time.Duration
+}
+
+func newCloudTasksEnqueuer(ctx context.Context, cfg *Config) (*cloudTasksEnqueuer, error) {
+	client, err := cloudtasks.NewClient(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("create cloud tasks client: %w", err)
+	}
+	return &cloudTasksEnqueuer{
+		client:           client,
+		queuePath:        cfg.CloudTasksQueue,
+		processEventURL:  cfg.ProcessEventURL,
+		invokerSA:        cfg.TasksInvokerSA,
+		dispatchDeadline: 30 * time.Minute,
+	}, nil
+}
+
+func (e *cloudTasksEnqueuer) Enqueue(ctx context.Context, payload TaskPayload) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal task payload: %w", err)
+	}
+	req := &taskspb.CreateTaskRequest{
+		Parent: e.queuePath,
+		Task: &taskspb.Task{
+			MessageType: &taskspb.Task_HttpRequest{
+				HttpRequest: &taskspb.HttpRequest{
+					HttpMethod: taskspb.HttpMethod_POST,
+					Url:        e.processEventURL,
+					Body:       body,
+					Headers:    map[string]string{"Content-Type": "application/json"},
+					AuthorizationHeader: &taskspb.HttpRequest_OidcToken{
+						OidcToken: &taskspb.OidcToken{
+							ServiceAccountEmail: e.invokerSA,
+							Audience:            e.processEventURL,
+						},
+					},
+				},
+			},
+			DispatchDeadline: durationpb.New(e.dispatchDeadline),
+		},
+	}
+	if _, err := e.client.CreateTask(ctx, req); err != nil {
+		return fmt.Errorf("create task: %w", err)
+	}
+	return nil
+}
+
 // ----------------------------------------------------------------------------
 // Server
 // ----------------------------------------------------------------------------
 
 type Server struct {
 	cfg *Config
+
+	// taskEnqueuer creates Cloud Tasks tasks that will trigger
+	// /process-event. handleWebhook calls this instead of spawning a
+	// goroutine. Nil until wired in main() (production) or a test.
+	taskEnqueuer TaskEnqueuer
 
 	// tokenValidator verifies OIDC bearer tokens on /process-event
 	// requests. Nil until wired in main() (production) or a test.
@@ -242,9 +327,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("create id token validator: %v", err)
 	}
+	enqueuer, err := newCloudTasksEnqueuer(ctx, cfg)
+	if err != nil {
+		log.Fatalf("create cloud tasks enqueuer: %v", err)
+	}
 
 	srv := &Server{
 		cfg:            cfg,
+		taskEnqueuer:   enqueuer,
 		tokenValidator: validator,
 	}
 	// Wire the per-event work function to the real implementation.
@@ -347,38 +437,31 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Capture by value before launching goroutine.
-		downloadToken := evt.DownloadToken
-		meeting := payload.Object
-		eventName := evt.Event
-
-		// Only the initial recording.completed event writes the
-		// meeting-metadata.json file. The transcript event fires separately
-		// for the same meeting; writing metadata twice would produce a
-		// second file with misleading counts (files_uploaded would reflect
-		// only the transcript).
-		writeMetadata := eventName == "recording.completed"
+		// Enqueue a Cloud Tasks task that will trigger /process-event
+		// in a separate inbound request. This lets the slow Zoom →
+		// Drive upload run under an active request lifecycle (full CPU,
+		// no instance reaping) instead of a background goroutine that
+		// Cloud Run can't see. See issue #8.
+		taskPayload := TaskPayload{
+			EventName:     evt.Event,
+			Meeting:       payload.Object,
+			DownloadToken: evt.DownloadToken,
+			// Only recording.completed writes meeting-metadata.json;
+			// recording.transcript_completed fires separately for the
+			// same meeting and must not write a second metadata file.
+			WriteMetadata: evt.Event == "recording.completed",
+		}
+		if err := s.taskEnqueuer.Enqueue(r.Context(), taskPayload); err != nil {
+			log.Printf("enqueue task event=%s meetingID=%d: %v", evt.Event, payload.Object.ID, err)
+			// 5xx so Zoom retries — our downstream can't be reached yet.
+			http.Error(w, "enqueue failed", http.StatusInternalServerError)
+			return
+		}
+		log.Printf("enqueued task event=%s meetingID=%d files=%d",
+			evt.Event, payload.Object.ID, len(payload.Object.RecordingFiles))
 
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "OK")
-
-		// IMPORTANT: use context.Background() here, NOT r.Context().
-		//
-		// The HTTP request's context is canceled the moment this handler
-		// returns, which would immediately cancel the goroutine's Drive
-		// upload (the upload uses ctx internally to abort in-flight HTTP
-		// requests). The goroutine needs a fresh, never-canceled context
-		// because the work outlives the HTTP request that spawned it.
-		//
-		// This is a classic Go webhook-handler gotcha and the compiler
-		// cannot catch it — both expressions have the same type.
-		// See docs/design-decisions.md "Decision 4" for details.
-		go func() {
-			ctx := context.Background()
-			if err := s.processRecording(ctx, meeting, downloadToken, writeMetadata); err != nil {
-				log.Printf("processRecording error event=%s meetingID=%d: %v", eventName, meeting.ID, err)
-			}
-		}()
 		return
 
 	default:
