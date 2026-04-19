@@ -120,6 +120,39 @@ type RecordingFile struct {
 }
 
 // ----------------------------------------------------------------------------
+// Cloud Tasks primitives
+// ----------------------------------------------------------------------------
+
+// TaskPayload is the JSON body of a Cloud Tasks task that triggers
+// /process-event. It carries everything processRecording needs to
+// download files from Zoom and upload them to Drive, independent of
+// the original webhook request that enqueued the task. The payload is
+// a few KB — well under Cloud Tasks' 1 MB per-task limit.
+type TaskPayload struct {
+	EventName     string      `json:"event_name"`
+	Meeting       ZoomMeeting `json:"meeting"`
+	DownloadToken string      `json:"download_token"`
+	WriteMetadata bool        `json:"write_metadata"`
+}
+
+// TaskEnqueuer abstracts the dependency on Cloud Tasks so handleWebhook
+// can be tested without hitting the real service. Production uses a
+// cloud.google.com/go/cloudtasks-backed implementation; tests use a
+// fake that captures what was enqueued.
+type TaskEnqueuer interface {
+	Enqueue(ctx context.Context, payload TaskPayload) error
+}
+
+// TokenValidator abstracts OIDC bearer token verification so
+// handleProcessEvent can be tested without real Google-signed tokens.
+// Production uses a google.golang.org/api/idtoken-backed implementation;
+// the synthetic test driver (running against the Cloud Tasks emulator,
+// which does not sign OIDC tokens) uses a fake pass-through validator.
+type TokenValidator interface {
+	Validate(ctx context.Context, token string, audience string) error
+}
+
+// ----------------------------------------------------------------------------
 // Server
 // ----------------------------------------------------------------------------
 
