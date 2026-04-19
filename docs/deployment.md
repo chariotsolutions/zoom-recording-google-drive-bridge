@@ -169,7 +169,42 @@ Expected output: an updated IAM policy with the binding shown.
 
 ---
 
-## Step 5: Deploy to Cloud Run
+## Step 5: Provision Cloud Tasks infra
+
+The bridge uses Cloud Tasks to move long-running download/upload work
+off the Zoom webhook request path (see `docs/design-decisions.md`
+"Decision 6" for why). Before the first deploy, provision the queue
+and IAM bindings:
+
+```bash
+PROJECT_ID=<YOUR_PROJECT_ID> \
+  REGION=us-east1 \
+  SERVICE_NAME=zoom-recording-bridge \
+  SERVICE_ACCOUNT=<YOUR_SERVICE_ACCOUNT> \
+  ./scripts/provision-cloud-tasks-infra.sh
+```
+
+This creates:
+
+- A Cloud Tasks queue (`zoom-recording-jobs` by default) with
+  `max-concurrent-dispatches=1` (serializes task execution, same
+  invariant the old in-process mutex gave us) and
+  `max-retry-duration=14400s` (4 h, comfortably under Zoom's 24 h
+  download_token expiry).
+- IAM binding: service account gets `roles/cloudtasks.enqueuer` (the
+  bridge creates tasks from `/webhook`).
+- IAM binding: service account gets `roles/run.invoker` on the Cloud
+  Run service (Cloud Tasks, signing as this SA, invokes
+  `/process-event`).
+- Cloud Run timeout bumped to **1800s** so the service request window
+  matches the 30-min dispatch deadline we set on each task. Without
+  this, Cloud Run would kill the `/process-event` handler at the
+  default 5 min regardless of what Cloud Tasks is willing to wait for.
+
+The script prints the `CLOUD_TASKS_QUEUE` resource name you'll need
+for the deploy step below.
+
+## Step 6: Deploy to Cloud Run
 
 This is the main event. Cloud Build compiles the Go code in the repo's
 `Dockerfile`, pushes the image to Artifact Registry, and deploys it to Cloud
@@ -184,12 +219,31 @@ gcloud run deploy zoom-recording-bridge \
   --allow-unauthenticated \
   --service-account <YOUR_SERVICE_ACCOUNT> \
   --set-env-vars DRIVE_ROOT_FOLDER_ID=<YOUR_FOLDER_ID> \
+  --set-env-vars PROCESS_EVENT_URL=<YOUR_SERVICE_URL>/process-event \
+  --set-env-vars CLOUD_TASKS_QUEUE=projects/<YOUR_PROJECT_ID>/locations/us-east1/queues/zoom-recording-jobs \
+  --set-env-vars TASKS_INVOKER_SA=<YOUR_SERVICE_ACCOUNT> \
   --update-secrets ZOOM_WEBHOOK_SECRET_TOKEN=zoom-webhook-secret:latest \
-  --max-instances=1
+  --max-instances=1 \
+  --timeout=1800
 ```
 
-Replace `<YOUR_FOLDER_ID>` with the Drive folder ID from the prerequisites
-(the folder ID is in the URL: `drive.google.com/drive/folders/<THIS_IS_THE_ID>`).
+**First-deploy chicken-and-egg:** `PROCESS_EVENT_URL` needs the service
+URL, which you don't know until the first deploy completes. Two options:
+
+- **Deploy once without `PROCESS_EVENT_URL`** (it's required by
+  `loadConfig`, so the service won't start — that's expected). Run
+  `gcloud run services describe zoom-recording-bridge --region=us-east1
+  --format="value(status.url)"` to get the URL, then redeploy with the
+  full command above.
+- **Or use a custom domain / reserved URL** you know in advance.
+
+Replace placeholders:
+
+- `<YOUR_FOLDER_ID>` — Drive folder ID from the prerequisites (the URL
+  segment: `drive.google.com/drive/folders/<THIS_IS_THE_ID>`)
+- `<YOUR_PROJECT_ID>` — the GCP project
+- `<YOUR_SERVICE_URL>` — `https://zoom-recording-bridge-<hash>.us-east1.run.app`
+- `<YOUR_SERVICE_ACCOUNT>` — runtime service account email
 
 What each flag does:
 
@@ -197,11 +251,15 @@ What each flag does:
 |---|---|
 | `--source .` | Build from the Dockerfile in the current directory |
 | `--region us-east1` | South Carolina — lowest latency for East Coast users |
-| `--allow-unauthenticated` | Public endpoint; Zoom needs to reach it from the internet |
-| `--service-account ...` | Runtime identity for the container (inherits Drive access) |
-| `--set-env-vars DRIVE_ROOT_FOLDER_ID=...` | Non-secret config as a plain env var |
+| `--allow-unauthenticated` | Public endpoint; Zoom needs to reach `/webhook` from the internet |
+| `--service-account ...` | Runtime identity for the container (inherits Drive + enqueue access) |
+| `--set-env-vars DRIVE_ROOT_FOLDER_ID=...` | Root Drive folder for uploads |
+| `--set-env-vars PROCESS_EVENT_URL=...` | Full URL for `/process-event`; used as the OIDC audience and the Cloud Tasks target URL |
+| `--set-env-vars CLOUD_TASKS_QUEUE=...` | Full resource name of the queue created in Step 5 |
+| `--set-env-vars TASKS_INVOKER_SA=...` | Service account Cloud Tasks impersonates when signing OIDC tokens for `/process-event` |
 | `--update-secrets ZOOM_WEBHOOK_SECRET_TOKEN=...` | Mount the Secret Manager secret as that env var |
-| `--max-instances=1` | Cap horizontal scaling at one instance; the in-process per-meeting mutex is sufficient at Chariot's webhook volume |
+| `--max-instances=1` | Cap horizontal scaling at one instance |
+| `--timeout=1800` | Cloud Run request timeout 30 min, matches Cloud Tasks' max dispatch deadline |
 
 **First deploy takes 3-5 minutes.** You'll see progress for:
 
@@ -222,11 +280,11 @@ When it succeeds, the last line of output is:
 Service URL: https://zoom-recording-bridge-<hash>.us-east1.run.app
 ```
 
-**Save this URL** — you'll use it in step 7.
+**Save this URL** — you'll use it in step 8 (Zoom Marketplace config).
 
 ---
 
-## Step 6: Sanity check the deployed service
+## Step 7: Sanity check the deployed service
 
 Before touching Zoom, verify the deployment is healthy.
 
@@ -269,7 +327,7 @@ This proves:
 - Response JSON is formatted correctly
 
 You can't verify the `encryptedToken` value is *correct* without knowing the
-real secret — but Zoom will verify it against the same secret in step 7.
+real secret — but Zoom will verify it against the same secret in step 8.
 
 ### Cloud Run reserves `/healthz`
 
@@ -285,7 +343,7 @@ liveness signal, `/` returns 200 with plain text.
 
 ---
 
-## Step 7: Configure the Zoom Marketplace app
+## Step 8: Configure the Zoom Marketplace app
 
 Now point Zoom at the Cloud Run URL.
 
@@ -325,7 +383,7 @@ Now point Zoom at the Cloud Run URL.
 
 ---
 
-## Step 8: End-to-end test with a real meeting
+## Step 9: End-to-end test with a real meeting
 
 The ultimate verification: run a real Zoom recording through the whole
 pipeline.
@@ -409,8 +467,12 @@ gcloud run deploy zoom-recording-bridge \
   --allow-unauthenticated \
   --service-account <YOUR_SERVICE_ACCOUNT> \
   --set-env-vars DRIVE_ROOT_FOLDER_ID=<YOUR_FOLDER_ID> \
+  --set-env-vars PROCESS_EVENT_URL=<YOUR_SERVICE_URL>/process-event \
+  --set-env-vars CLOUD_TASKS_QUEUE=projects/<YOUR_PROJECT_ID>/locations/us-east1/queues/zoom-recording-jobs \
+  --set-env-vars TASKS_INVOKER_SA=<YOUR_SERVICE_ACCOUNT> \
   --update-secrets ZOOM_WEBHOOK_SECRET_TOKEN=zoom-webhook-secret:latest \
-  --max-instances=1
+  --max-instances=1 \
+  --timeout=1800
 ```
 
 Same command as the initial deploy. Cloud Run creates a new revision and
