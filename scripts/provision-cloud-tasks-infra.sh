@@ -67,26 +67,43 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --role=roles/cloudtasks.enqueuer
 
 echo ""
-echo "-- granting roles/run.invoker on $SERVICE_NAME to $SERVICE_ACCOUNT --"
-# Cloud Tasks, signing as this SA, invokes the /process-event endpoint
-# on the Cloud Run service. The SA needs permission to invoke its own
-# service (this is a common pattern, not as circular as it looks).
-gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
-  --region="$REGION" \
-  --project="$PROJECT_ID" \
-  --member="serviceAccount:$SERVICE_ACCOUNT" \
-  --role=roles/run.invoker
+# run.invoker binding and --timeout=1800 both need the Cloud Run service
+# to already exist. On a first-time deploy it doesn't — skip those here
+# and re-run the script after the first `gcloud run deploy`.
+if gcloud run services describe "$SERVICE_NAME" \
+    --region="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1; then
+  echo "-- granting roles/run.invoker on $SERVICE_NAME to $SERVICE_ACCOUNT --"
+  # Cloud Tasks, signing as this SA, invokes the /process-event endpoint
+  # on the Cloud Run service. The SA needs permission to invoke its own
+  # service (this is a common pattern, not as circular as it looks).
+  gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
+    --region="$REGION" \
+    --project="$PROJECT_ID" \
+    --member="serviceAccount:$SERVICE_ACCOUNT" \
+    --role=roles/run.invoker
 
-echo ""
-echo "-- setting Cloud Run request timeout to 1800s (30 min) --"
-# Cloud Run's default request timeout is 5 min. Cloud Tasks can hold a
-# dispatch open for up to 30 min. The effective budget for the
-# /process-event handler is min(DispatchDeadline, Cloud Run --timeout),
-# so Cloud Run must be at least as large as the deadline we want.
-gcloud run services update "$SERVICE_NAME" \
-  --region="$REGION" \
-  --project="$PROJECT_ID" \
-  --timeout=1800
+  echo ""
+  echo "-- setting Cloud Run request timeout to 1800s (30 min) --"
+  # Cloud Run's default request timeout is 5 min. Cloud Tasks can hold a
+  # dispatch open for up to 30 min. The effective budget for the
+  # /process-event handler is min(DispatchDeadline, Cloud Run timeout),
+  # so Cloud Run must be at least as large as the deadline we want.
+  gcloud run services update "$SERVICE_NAME" \
+    --region="$REGION" \
+    --project="$PROJECT_ID" \
+    --timeout=1800
+else
+  echo ""
+  echo "!! Cloud Run service '$SERVICE_NAME' does not exist yet in"
+  echo "!! '$PROJECT_ID' / '$REGION'. Skipping:"
+  echo "!!   * roles/run.invoker binding on the service"
+  echo "!!   * --timeout=1800 update"
+  echo "!!"
+  echo "!! These need the service to exist. After your first"
+  echo "!! 'gcloud run deploy' (include --timeout=1800 in the deploy"
+  echo "!! command to cover that setting up-front), re-run this script"
+  echo "!! to complete the provisioning."
+fi
 
 echo ""
 echo "== done =="
