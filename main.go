@@ -26,6 +26,7 @@ import (
 
 	"golang.org/x/time/rate"
 	"google.golang.org/api/drive/v3"
+	"google.golang.org/api/idtoken"
 	"google.golang.org/api/option"
 )
 
@@ -68,6 +69,7 @@ func loadConfig() (*Config, error) {
 		ZoomWebhookSecret: os.Getenv("ZOOM_WEBHOOK_SECRET_TOKEN"),
 		DriveRootFolderID: os.Getenv("DRIVE_ROOT_FOLDER_ID"),
 		Port:              getEnvDefault("PORT", "8080"),
+		ProcessEventURL:   os.Getenv("PROCESS_EVENT_URL"),
 	}
 
 	missing := []string{}
@@ -76,6 +78,9 @@ func loadConfig() (*Config, error) {
 	}
 	if cfg.DriveRootFolderID == "" {
 		missing = append(missing, "DRIVE_ROOT_FOLDER_ID")
+	}
+	if cfg.ProcessEventURL == "" {
+		missing = append(missing, "PROCESS_EVENT_URL")
 	}
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required env vars: %s", strings.Join(missing, ", "))
@@ -168,6 +173,28 @@ type TokenValidator interface {
 	Validate(ctx context.Context, token string, audience string) error
 }
 
+// idtokenValidator is the production TokenValidator. It wraps
+// google.golang.org/api/idtoken's Validator to conform to our
+// TokenValidator interface. The Validator fetches Google's public
+// OIDC signing keys (cached) to verify tokens signed by Cloud Tasks'
+// service account.
+type idtokenValidator struct {
+	inner *idtoken.Validator
+}
+
+func newIDTokenValidator(ctx context.Context) (*idtokenValidator, error) {
+	v, err := idtoken.NewValidator(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &idtokenValidator{inner: v}, nil
+}
+
+func (v *idtokenValidator) Validate(ctx context.Context, token string, audience string) error {
+	_, err := v.inner.Validate(ctx, token, audience)
+	return err
+}
+
 // ----------------------------------------------------------------------------
 // Server
 // ----------------------------------------------------------------------------
@@ -209,7 +236,20 @@ func main() {
 		log.Fatalf("config error: %v", err)
 	}
 
-	srv := &Server{cfg: cfg}
+	ctx := context.Background()
+
+	validator, err := newIDTokenValidator(ctx)
+	if err != nil {
+		log.Fatalf("create id token validator: %v", err)
+	}
+
+	srv := &Server{
+		cfg:            cfg,
+		tokenValidator: validator,
+	}
+	// Wire the per-event work function to the real implementation.
+	// Tests substitute a stub directly on the field.
+	srv.processEventFn = srv.processRecording
 
 	// Single process-wide limiter shared across all /webhook requests.
 	// Rejected requests return 429 before any body read or HMAC work.
@@ -218,6 +258,10 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleRoot)
 	mux.Handle("/webhook", rateLimitMiddleware(limiter, http.HandlerFunc(srv.handleWebhook)))
+	// /process-event is invoked by Cloud Tasks with an OIDC bearer token.
+	// Not rate-limited — it is only reachable to holders of a valid
+	// Google-signed token for our service account.
+	mux.HandleFunc("/process-event", srv.handleProcessEvent)
 
 	log.Printf("listening on :%s", cfg.Port)
 	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
