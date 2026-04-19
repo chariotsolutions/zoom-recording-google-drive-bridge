@@ -27,30 +27,65 @@ application or platform level:
 | Layer | What it does | Protects against |
 |---|---|---|
 | **TLS** (automatic from Cloud Run) | Encrypts traffic in transit between Zoom and the endpoint | Network eavesdropping, man-in-the-middle, packet sniffing |
-| **HMAC-SHA256 signature verification** | Zoom signs each event body with a shared secret; the bridge computes the same HMAC and compares with `hmac.Equal` (constant-time) | Forged webhook events from anyone who doesn't know the secret |
-| **5-minute replay window** | Rejects events with timestamps older than 5 minutes | Replaying a captured valid signed request after the fact |
-| **Request body size limit** | `io.LimitReader` caps the body at 1 MB (see [issue #4](https://github.com/chariotsolutions/zoom-recording-google-drive-bridge/issues/4)) | Oversized payloads burning memory before the signature check runs |
-| **Global rate limiting** | Token-bucket limiter in front of `/webhook`: 10 rps sustained / burst 20; returns 429 before body read or HMAC (see [issue #6](https://github.com/chariotsolutions/zoom-recording-google-drive-bridge/issues/6)) | Burning CPU on forged traffic from a single source below the DDoS threshold |
+| **HMAC-SHA256 signature verification** (`/webhook`) | Zoom signs each event body with a shared secret; the bridge computes the same HMAC and compares with `hmac.Equal` (constant-time) | Forged webhook events from anyone who doesn't know the secret |
+| **OIDC bearer token verification** (`/process-event`) | Cloud Tasks attaches a Google-signed JWT with `aud = PROCESS_EVENT_URL`; the handler verifies signature, audience, and expiry using `google.golang.org/api/idtoken` | Forged task dispatches from anyone who can't impersonate our service account |
+| **5-minute replay window** (`/webhook`) | Rejects events with timestamps older than 5 minutes | Replaying a captured valid signed request after the fact |
+| **Request body size limit** | `io.LimitReader` caps the body at 1 MB on both endpoints (see [issue #4](https://github.com/chariotsolutions/zoom-recording-google-drive-bridge/issues/4)) | Oversized payloads burning memory before signature/OIDC checks run |
+| **Global rate limiting** (`/webhook`) | Token-bucket limiter in front of `/webhook`: 10 rps sustained / burst 20; returns 429 before body read or HMAC (see [issue #6](https://github.com/chariotsolutions/zoom-recording-google-drive-bridge/issues/6)) | Burning CPU on forged traffic from a single source below the DDoS threshold |
 | **`max-instances=1` on Cloud Run** | Caps horizontal scaling at one container; the in-process per-meeting mutex is sufficient at Chariot's webhook volume | Runaway autoscaling cost if the endpoint is hammered |
 | **Distroless container** | No shell, no package manager, no system tools in the runtime image | Post-exploitation lateral movement — if an attacker somehow gets code execution, there's nothing to use |
 | **Scoped service account** | Cloud Run runs as a service account that only has Contributor access to one specific Drive folder | Blast radius containment — even if compromised, the service can only write to that one folder |
 | **Secret in Secret Manager** | The webhook secret is never in code, env vars, shell history, or git | Secret leakage via repo, deploy logs, or process listing |
+
+### Both endpoints are publicly reachable at the network layer
+
+The Cloud Run service exposes two endpoints: `/webhook` (called by Zoom
+from the public internet) and `/process-event` (called by Cloud Tasks
+with an OIDC bearer token). The service is deployed with
+`--allow-unauthenticated`, which grants `roles/run.invoker` to
+`allUsers` across the **whole service** — there is no way in Cloud Run
+to allow unauthenticated traffic to `/webhook` while requiring IAM on
+`/process-event`. Both paths accept any inbound request at the network
+layer; each handler then enforces its own application-layer auth.
+
+Why this is acceptable:
+
+- `/webhook` **has to be public** for Zoom to reach it. Zoom is not a
+  Google Cloud IAM principal.
+- `/process-event` **could in theory be locked down** with a second
+  Cloud Run service (one `--allow-unauthenticated` for `/webhook`,
+  one `--no-allow-unauthenticated` for `/process-event`). We don't do
+  this because the split adds material complexity for minimal gain:
+  the OIDC validator in the `/process-event` handler is strong
+  enough that "network-reachable but OIDC-protected" is equivalent to
+  "network-unreachable without IAM" for any realistic attacker.
+- Forging a request that passes OIDC verification requires
+  `iam.serviceAccounts.actAs` on a service account that itself has
+  `roles/run.invoker` on the service — a capability no one outside
+  the project's IAM has.
+
+So "publicly reachable" reads as a surprise if you're thinking about
+it in network terms, but the trust model that actually matters lives
+at the application layer on both paths, and that's by design.
 
 ### What this posture gets right
 
 The HMAC signature + replay window is exactly the security model Zoom
 designed for webhook integrations. An attacker who doesn't know the
 webhook secret cannot produce a valid signature, regardless of how they
-reach the endpoint. The distroless container and scoped service account
-are defense-in-depth that most webhook services don't bother with.
+reach the endpoint. The OIDC-based protection on `/process-event` gives
+equivalent application-layer strength for the Cloud Tasks callback
+path. The distroless container and scoped service account are
+defense-in-depth that most webhook services don't bother with.
 
 ### What this posture is missing
 
 **No network-layer controls on inbound traffic.** Anyone on the internet
-can send HTTP requests to the endpoint. The rate limiter and HMAC check
-reject forged requests before any Drive work happens, but the requests
-still reach the application — consuming a cold start and a small amount
-of Cloud Run billing.
+can send HTTP requests to either endpoint. Forged requests are rejected
+at the application layer (HMAC on `/webhook`, OIDC on `/process-event`)
+before any Drive work happens, but the requests still reach the
+application — consuming a cold start and a small amount of Cloud Run
+billing.
 
 **No per-IP rate limiting.** The token bucket in front of `/webhook` is
 global: a single attacker at the threshold still consumes all the
