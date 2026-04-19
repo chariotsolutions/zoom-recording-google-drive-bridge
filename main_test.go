@@ -1,16 +1,20 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -803,3 +807,138 @@ func dumpRequest(t *testing.T, prefix string, rec *httptest.ResponseRecorder) {
 
 // Compile-time check we still use fmt (kept available for future tests).
 var _ = fmt.Sprintf
+
+// ----------------------------------------------------------------------------
+// Tier 3: Cloud Tasks primitives
+// ----------------------------------------------------------------------------
+
+// fakeTaskEnqueuer captures enqueued payloads for test assertion. Safe
+// for concurrent use. Always captures the payload, even if returnErr
+// is set — callers assert on both behaviors.
+type fakeTaskEnqueuer struct {
+	mu        sync.Mutex
+	enqueued  []TaskPayload
+	returnErr error
+}
+
+func (f *fakeTaskEnqueuer) Enqueue(ctx context.Context, payload TaskPayload) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.enqueued = append(f.enqueued, payload)
+	return f.returnErr
+}
+
+// fakeTokenValidator captures the last (token, audience) pair handed to
+// Validate and returns returnErr (nil = valid). Used by tests that
+// exercise handleProcessEvent and by the synthetic test driver when
+// running against the Cloud Tasks emulator.
+type fakeTokenValidator struct {
+	mu           sync.Mutex
+	lastToken    string
+	lastAudience string
+	returnErr    error
+}
+
+func (f *fakeTokenValidator) Validate(ctx context.Context, token, audience string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastToken = token
+	f.lastAudience = audience
+	return f.returnErr
+}
+
+func TestTaskPayload_JSONRoundTrip(t *testing.T) {
+	orig := TaskPayload{
+		EventName: "recording.completed",
+		Meeting: ZoomMeeting{
+			ID:        12345,
+			UUID:      "uuid-123",
+			HostID:    "host-abc",
+			HostEmail: "skapadia@chariotsolutions.com",
+			Topic:     "Test Meeting",
+			StartTime: "2026-04-18T12:00:00Z",
+			Duration:  45,
+			RecordingFiles: []RecordingFile{
+				{
+					ID:             "file-1",
+					MeetingID:      "mtg-1",
+					RecordingStart: "2026-04-18T12:00:00Z",
+					RecordingEnd:   "2026-04-18T12:45:00Z",
+					FileType:       "MP4",
+					FileExtension:  "MP4",
+					FileSize:       123456,
+					PlayURL:        "https://zoom.us/rec/play/abc",
+					DownloadURL:    "https://zoom.us/rec/download/abc",
+					RecordingType:  "shared_screen_with_speaker_view",
+					Status:         "completed",
+				},
+			},
+		},
+		DownloadToken: "abc-123-token",
+		WriteMetadata: true,
+	}
+
+	b, err := json.Marshal(&orig)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var got TaskPayload
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if !reflect.DeepEqual(orig, got) {
+		t.Fatalf("round-trip mismatch:\norig = %+v\ngot  = %+v", orig, got)
+	}
+}
+
+func TestFakeTaskEnqueuer_Captures(t *testing.T) {
+	f := &fakeTaskEnqueuer{}
+	p := TaskPayload{EventName: "recording.completed", DownloadToken: "abc"}
+	if err := f.Enqueue(context.Background(), p); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if len(f.enqueued) != 1 {
+		t.Fatalf("enqueued len = %d, want 1", len(f.enqueued))
+	}
+	if f.enqueued[0].EventName != "recording.completed" {
+		t.Errorf("EventName = %q, want %q", f.enqueued[0].EventName, "recording.completed")
+	}
+	if f.enqueued[0].DownloadToken != "abc" {
+		t.Errorf("DownloadToken = %q, want %q", f.enqueued[0].DownloadToken, "abc")
+	}
+}
+
+func TestFakeTaskEnqueuer_ReturnsConfiguredError(t *testing.T) {
+	want := errors.New("boom")
+	f := &fakeTaskEnqueuer{returnErr: want}
+	err := f.Enqueue(context.Background(), TaskPayload{})
+	if !errors.Is(err, want) {
+		t.Fatalf("err = %v, want %v", err, want)
+	}
+	// Even on error, the fake captures the payload so tests can
+	// assert on what was attempted.
+	if len(f.enqueued) != 1 {
+		t.Errorf("enqueued len = %d, want 1 (capture on error too)", len(f.enqueued))
+	}
+}
+
+func TestFakeTokenValidator_AcceptsByDefault(t *testing.T) {
+	f := &fakeTokenValidator{}
+	if err := f.Validate(context.Background(), "tok", "aud"); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if f.lastToken != "tok" || f.lastAudience != "aud" {
+		t.Errorf("captured (%q, %q), want (tok, aud)", f.lastToken, f.lastAudience)
+	}
+}
+
+func TestFakeTokenValidator_ReturnsConfiguredError(t *testing.T) {
+	want := errors.New("invalid token")
+	f := &fakeTokenValidator{returnErr: want}
+	err := f.Validate(context.Background(), "x", "y")
+	if !errors.Is(err, want) {
+		t.Fatalf("err = %v, want %v", err, want)
+	}
+}
