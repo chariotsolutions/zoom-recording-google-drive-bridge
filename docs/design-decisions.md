@@ -82,6 +82,15 @@ call sites, re-ran the driver, and confirmed.
 
 ## Decision 1: Per-meeting mutex via `sync.Map` for serializing concurrent events
 
+> **Superseded by Decision 6.** The goroutine pattern this mutex
+> protected no longer exists — Cloud Tasks with
+> `max-concurrent-dispatches=1` on the queue now serializes events at
+> the queue layer. Kept here for historical context because the
+> original race condition this solved is real and worth understanding
+> before making changes that might re-introduce it.
+
+
+
 **The problem.** Zoom delivers `recording.completed` and
 `recording.transcript_completed` as separate webhook events for the same
 meeting. They can arrive within milliseconds of each other, and Zoom does
@@ -176,6 +185,15 @@ routing, security gates); integration-test the parts where bugs live
 
 ## Decision 4: `context.Background()` in the background goroutine
 
+> **Superseded by Decision 6.** The goroutine-after-ACK pattern has
+> been replaced with Cloud Tasks + `/process-event`, so this specific
+> gotcha no longer applies to the production code path. Left here as
+> an important reminder of why that pattern is fraught on serverless
+> platforms — if anyone ever reintroduces a background goroutine that
+> outlives a request, the `context.Background()` vs `r.Context()` trap
+> still applies, and the broader CPU-throttling / instance-reaping
+> problem (Decision 6) will still bite.
+
 The webhook handler responds 200 OK to Zoom immediately and spawns a
 background goroutine to do the actual Drive uploads. Inside the goroutine
 we use `context.Background()` rather than `r.Context()`, and this is
@@ -244,6 +262,100 @@ concurrently and produce duplicate host folders. The blast radius is
 cosmetic (two folders with the same name; Drive lookups remain
 deterministic per-process) and the existing per-meeting mutex prevents
 the race for events sharing a meeting ID. Not fixed in this PR.
+
+---
+
+## Decision 6: Cloud Tasks for async processing (replaces goroutine-after-ACK)
+
+On 2026-04-14 a real production recording silently completed only 1 of
+5 files. The bridge had ACKed the webhook fast and spawned a background
+goroutine to do the download-and-upload work — a pattern that works
+fine on a traditional always-on server but fails on Cloud Run because:
+
+- CPU is throttled to near-zero when no inbound request is active, per
+  [Cloud Run's billing docs](https://cloud.google.com/run/docs/configuring/billing-settings).
+  The goroutine's TLS crypto couldn't keep up with the network, so the
+  MP4 that would normally transfer in 1–2 minutes took 23 minutes.
+- Idle instances can be reaped at any time up to 15 min, per the
+  [Container Runtime Contract](https://cloud.google.com/run/docs/container-contract).
+  The goroutine was killed mid-stream on the second file.
+
+See [issue #8](https://github.com/chariotsolutions/zoom-recording-google-drive-bridge/issues/8)
+for the incident timeline and verified documentation citations.
+
+**What we chose.** Move the work off the original Zoom webhook request
+and onto a *second* Cloud Tasks-triggered HTTP request to the same
+Cloud Run service. `/webhook` ACKs Zoom fast after enqueueing a task;
+Cloud Tasks then calls `/process-event` with an OIDC bearer token;
+`/process-event` runs `processRecording` synchronously inside an
+active inbound request (so Cloud Run keeps full CPU allocated for the
+duration, and the instance is not reaped mid-work).
+
+One task per webhook event, not per file. Retry duplication on failure
+is accepted as a manageable edge case — if it becomes a real
+operational annoyance, a lightweight idempotency check can be added
+later without restructuring the design.
+
+The per-meeting `sync.Map` mutex from Decision 1 is retired by this
+commit. Serialization now lives at the queue layer via
+`max-concurrent-dispatches=1`.
+
+**What we rejected.**
+
+- **`--no-cpu-throttling` + `--min-instances=1` on Cloud Run.** The
+  smallest possible fix — keep CPU allocated, keep one instance warm,
+  goroutine pattern still works. Rejected because it costs ~$10–15/mo
+  for the always-on instance and is still fragile (a flag change
+  several months from now could regress silently). The real fix
+  decouples us from the Cloud Run request lifecycle entirely.
+- **Per-file tasks instead of per-event.** Cleaner retry semantics (one
+  file fails → only that file retries, no duplicate uploads of the
+  previously-succeeded files). Deferred because per-event is a much
+  smaller migration and the duplicate-on-retry risk is cosmetic and
+  rare in practice.
+- **Cloud Run Jobs for the dispatched work.** Cloud Run Jobs run up to
+  24 h and are better-fit for true batch workloads, but can't be
+  invoked directly by Cloud Tasks (would need a thin HTTP→Jobs
+  adapter). The workload here — single-digit minutes for even the
+  largest meetings once CPU is available — fits comfortably in the
+  60-min Cloud Run request ceiling.
+
+**Documentation this design is built on.**
+
+- [Hosting webhooks targets](https://cloud.google.com/run/docs/triggering/webhooks)
+  — Google explicitly recommends Pub/Sub or Cloud Tasks for webhook
+  work that exceeds the request budget.
+- [Using Cloud Tasks with Cloud Run](https://cloud.google.com/run/docs/triggering/using-tasks)
+  — Google explicitly documents Cloud Run as a supported Cloud Tasks
+  target, including the OIDC auth pattern via
+  `roles/cloudtasks.enqueuer` + `roles/run.invoker`.
+
+Those two docs sanction the two halves of the architecture
+independently. The specific composition (one Cloud Run service
+exposing both `/webhook` and `/process-event`) is ours.
+
+**Constraints the design honors.**
+
+- Cloud Tasks HTTP dispatch deadline: 30 min max per attempt. Set
+  explicitly via `Task.DispatchDeadline`.
+- Cloud Run request timeout: set to 1800s (30 min) to match
+  dispatch deadline. Default 5 min would kill the handler early.
+- Zoom `download_token` validity: ~24 h per Zoom staff. Queue retry
+  duration bounded to 4 h so we never retry against an expired
+  token. `/process-event` returns 410 (permanent) on a Zoom 401 so
+  Cloud Tasks stops retrying immediately.
+- OIDC authentication between Cloud Tasks and `/process-event` is
+  mandatory. No rate limit on `/process-event` — OIDC is the gate.
+
+**Local-dev escape hatch.** Google does not ship an official Cloud
+Tasks emulator. For the synthetic test driver to work on a developer
+laptop without real Cloud Tasks infra, the bridge honors a
+`BRIDGE_IN_PROCESS_FAKE_TASKS=1` env var that swaps in a fake
+enqueuer (which POSTs directly to `/process-event` from a goroutine,
+serialized via a mutex to mimic `max-concurrent-dispatches=1`) and a
+pass-through OIDC validator. This is gated by an opt-in env var and
+logs a prominent WARNING at startup. Never set in production — see
+`main.go` for the in-process fake's safety notes.
 
 ---
 

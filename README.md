@@ -19,17 +19,26 @@ without buffering the whole file.
    webhook secret, 5-minute replay window)
 3. Handles the `endpoint.url_validation` handshake
 4. On `recording.completed` and `recording.transcript_completed`:
+   - Enqueues a Cloud Tasks task for the event and ACKs Zoom immediately
+   - The queue (`max-concurrent-dispatches=1`) serializes execution and
+     provides durable retry
+5. Cloud Tasks dispatches each task to `/process-event` (OIDC-authenticated)
+   which does the actual Zoom → Drive work synchronously:
    - Creates a Drive folder structure:
-     `<root>/<host_username>/<YYYY-MM-DD>-<topic>/raw/`
+     `<root>/<host_username>/<YYYY-MM-DDThh-mm>-<topic>/raw/`
      where `host_username` is the lowercased local part of the meeting
      host's email (e.g., `skapadia` from `skapadia@chariotsolutions.com`)
    - Streams each recording file (MP4, M4A, timeline.json, transcript VTT)
      from Zoom into Drive using the per-event `download_token` for auth
    - Writes a `meeting-metadata.json` file (only on the initial
      `recording.completed` event to avoid overwriting)
-5. Serializes concurrent events for the same meeting with a per-meeting
-   mutex, so the two events can arrive in either order without creating
-   duplicate folders
+
+The two-endpoint design exists because Cloud Run throttles CPU
+between inbound requests and can reap idle instances — background
+goroutines spawned from `/webhook` would get killed mid-upload. See
+[`docs/design-decisions.md`](./docs/design-decisions.md) "Decision 6"
+and [issue #8](https://github.com/chariotsolutions/zoom-recording-google-drive-bridge/issues/8)
+for the full story.
 
 ### Limitations
 
@@ -45,7 +54,11 @@ without buffering the whole file.
 |---|---|
 | `ZOOM_WEBHOOK_SECRET_TOKEN` | From your Zoom Marketplace app → Feature → Secret Token |
 | `DRIVE_ROOT_FOLDER_ID` | Google Drive folder ID where recordings will land |
+| `PROCESS_EVENT_URL` | Full URL of this service's `/process-event` endpoint (e.g. `https://…run.app/process-event`) |
+| `CLOUD_TASKS_QUEUE` | Queue resource name, `projects/.../locations/.../queues/…` |
+| `TASKS_INVOKER_SA` | Service account email Cloud Tasks impersonates for OIDC tokens |
 | `PORT` | (Optional, defaults to 8080) |
+| `BRIDGE_IN_PROCESS_FAKE_TASKS` | (Test only) Set to `1` for local-dev/synthetic runs — short-circuits Cloud Tasks and OIDC verification. **Never set in production.** |
 
 See `.env.example` for a template.
 
