@@ -110,6 +110,85 @@ Keep the existing application-layer posture. No network-level filtering.
   controls (no regulated-client mandate, no compliance checkbox, no
   observed abuse)
 
+### Option 1.5: Split into two Cloud Run services (public webhook + private processor)
+
+Keep the application-layer posture of Option 1, but separate the two
+endpoints into distinct Cloud Run services so `/process-event` becomes
+unreachable from the public internet at the Cloud Run platform layer.
+
+```
+Internet                         Cloud Tasks (same queue, new target URL)
+  │                                   │
+  ▼                                   ▼
+Service A: zoom-webhook-bridge   Service B: zoom-event-processor
+(--allow-unauthenticated)        (--no-allow-unauthenticated)
+  │                                   │
+  │   only route: /webhook            │   only route: /process-event
+  │                                   │
+  └── enqueues tasks ─────────────────┘
+      (Cloud Tasks target is Service B's URL;
+       Cloud Tasks dispatches with OIDC as before)
+```
+
+- **Monthly cost:** ~$0 (both services scale to zero)
+- **IP allowlisting:** ❌ (Service A still public; Zoom requires that)
+- **Rate limiting:** ✅ global on `/webhook`; irrelevant on `/process-event` (unreachable)
+- **Operational overhead:** Low — two services instead of one
+- **When to choose:** A security review flags "any publicly-reachable
+  endpoint that touches Drive credentials" as a finding, even though
+  that endpoint is OIDC-gated. Defense-in-depth beyond application-
+  layer OIDC. Not worth it for observed threat model alone.
+
+**What changes:**
+
+- Recommended implementation: single Go binary with a `BRIDGE_ROLE=webhook|processor`
+  env var gating which routes are registered. Same image deployed twice
+  with different env vars and IAM. Avoids a codebase split and keeps
+  shared helpers (`processRecording`, folder helpers, `ZoomMeeting` types)
+  in one place.
+- Service A (webhook) IAM: `roles/cloudtasks.enqueuer`,
+  `roles/iam.serviceAccountUser` self-binding; does NOT need Drive
+  permissions (only enqueues tasks).
+- Service B (processor) IAM: Drive Contributor on the target folder,
+  `roles/run.invoker` for the SA Cloud Tasks dispatches as. Does NOT
+  need `roles/cloudtasks.enqueuer`.
+- Cloud Tasks target URL on newly-created tasks changes from Service A
+  to Service B. Same queue, same dispatch mechanics.
+- Provisioning: two `gcloud run deploy` invocations, a slightly more
+  involved provisioning script.
+
+**What's gained over Option 1:**
+
+- `/process-event` is unreachable from the public internet; an attacker
+  can't even probe the endpoint, let alone try to forge OIDC.
+- Clearer IAM separation of concerns: the webhook-facing SA never has
+  Drive credentials, so a compromise of Service A can only enqueue
+  tasks — it can't directly touch Drive.
+- Defense-in-depth against a future bug in the OIDC validator (our
+  code or the upstream `idtoken` library).
+
+**What's lost:**
+
+- Two services to deploy, monitor, log, and keep in sync.
+- Harder to trace a single recording end-to-end without joining logs
+  across two services.
+- Every deploy is now two deploys.
+- For OSS users forking this repo: higher barrier to adoption ("why do
+  I need to provision two Cloud Run services for a webhook bridge?").
+
+**Migration path from Option 1:**
+
+1. Refactor `main.go` to register routes based on `BRIDGE_ROLE`.
+2. Deploy Service A (`zoom-webhook-bridge`) with `BRIDGE_ROLE=webhook`,
+   `--allow-unauthenticated`. Drop Drive IAM.
+3. Deploy Service B (`zoom-event-processor`) with
+   `BRIDGE_ROLE=processor`, `--no-allow-unauthenticated`. Drop
+   `cloudtasks.enqueuer` IAM.
+4. Update `PROCESS_EVENT_URL` env var on Service A to point at Service
+   B's URL.
+5. Existing Cloud Tasks queue keeps working — only the dispatched URL
+   changes.
+
 ### Option 2: Cloud Run + Load Balancer + Cloud Armor
 
 Add a Global External Application Load Balancer in front of Cloud Run,
@@ -221,6 +300,7 @@ the Dockerfile control we use for distroless.
 | Option | Monthly cost | Scale to zero | IP allowlisting | Rate limiting | Ops overhead |
 |---|---|---|---|---|---|
 | **Cloud Run alone** (current) | ~$0 | ✅ | ❌ | ✅ global / ❌ per-IP | Minimal |
+| **Two Cloud Run services** (webhook public, processor private) | ~$0 | ✅ | ❌ | ✅ global on webhook only | Low |
 | **Cloud Run + LB + Cloud Armor** | ~$23 | ✅ | ✅ | ✅ per-IP | Low |
 | **Compute Engine VM** | ~$5–25 | ❌ | ✅ | ❌ | High |
 | **GKE Autopilot** | ~$75+ | ❌ | ✅ | ✅ | Moderate |
