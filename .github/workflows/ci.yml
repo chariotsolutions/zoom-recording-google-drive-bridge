@@ -1,11 +1,12 @@
-# Continuous integration: build, vet, format check, and test with the race
-# detector. Runs on every push to main and every pull request targeting main.
+# Continuous integration: build, vet, format check, test with the race
+# detector, and upload coverage to Codecov. Runs on every push to main
+# and every pull request targeting main.
 #
 # This catches the same things we run by hand:
 #   - go build ./...
 #   - go vet ./...
 #   - gofmt -s (the simplify pass — what dragged Go Report Card to a B before)
-#   - go test -race ./...
+#   - go test -race -covermode=atomic -coverprofile=coverage.out ./...
 
 name: CI
 
@@ -59,5 +60,13 @@ jobs:
       - name: Build
         run: go build ./...
 
-      - name: Test with race detector
-        run: go test -race ./...
+      - name: Test with race detector and coverage
+        # -covermode=atomic is required with -race (prevents a data race
+        # in the coverage counters themselves).
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.out
+          fail_ci_if_error: false # Don't block CI on Codecov outages

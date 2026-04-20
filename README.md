@@ -1,6 +1,7 @@
 # zoom-recording-google-drive-bridge
 
 [![CI](https://github.com/chariotsolutions/zoom-recording-google-drive-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/chariotsolutions/zoom-recording-google-drive-bridge/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/chariotsolutions/zoom-recording-google-drive-bridge/branch/main/graph/badge.svg)](https://codecov.io/gh/chariotsolutions/zoom-recording-google-drive-bridge)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/chariotsolutions/zoom-recording-google-drive-bridge)](go.mod)
 [![Go Report Card](https://goreportcard.com/badge/github.com/chariotsolutions/zoom-recording-google-drive-bridge)](https://goreportcard.com/report/github.com/chariotsolutions/zoom-recording-google-drive-bridge)
