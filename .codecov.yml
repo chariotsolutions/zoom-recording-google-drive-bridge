@@ -1,0 +1,20 @@
+# Codecov configuration
+# Docs: https://docs.codecov.com/docs/codecov-yaml
+
+# cmd/synthetic-test is an end-to-end test driver binary — it has no
+# unit tests by design (it IS the test). Excluding it so the overall
+# coverage number reflects the tested surface of the bridge itself.
+ignore:
+  - "cmd/synthetic-test"
+
+coverage:
+  status:
+    # Don't fail PRs on coverage regressions yet — establish a baseline
+    # first. Can tighten thresholds later once coverage stabilizes.
+    project:
+      default:
+        target: auto
+        threshold: 2%
+    patch:
+      default:
+        informational: true
