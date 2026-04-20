@@ -551,6 +551,19 @@ func TestHandleWebhook_Validation(t *testing.T) {
 	}
 }
 
+func TestHandleValidation_MalformedInnerPayload_Returns400(t *testing.T) {
+	srv := newTestServer()
+	// Outer envelope parses (event + payload as json.RawMessage), but the
+	// inner "payload" is a string instead of an object, so the second
+	// Unmarshal into ZoomValidationPayload fails. We should return 400 —
+	// NOT respond with a bogus encryptedToken for a missing plainToken.
+	body := []byte(`{"event":"endpoint.url_validation","payload":"not-an-object"}`)
+	rec := postWebhook(t, srv, body, false, "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%q", rec.Code, rec.Body.String())
+	}
+}
+
 func TestHandleWebhook_UnsignedEventRejected(t *testing.T) {
 	srv := newTestServer()
 	body := []byte(`{"event":"recording.completed","payload":{"object":{}}}`)
@@ -1182,6 +1195,49 @@ func TestStreamFileToDrive_Zoom401_ReturnsErrZoomUnauthorized(t *testing.T) {
 	err := srv.streamFileToDrive(context.Background(), nil, file, "some-token", "parent", "filename.mp4")
 	if !errors.Is(err, errZoomUnauthorized) {
 		t.Fatalf("err = %v, want wrapped errZoomUnauthorized", err)
+	}
+}
+
+// TestStreamFileToDrive_Zoom500 confirms that non-401 errors from Zoom
+// return a plain error (NOT the errZoomUnauthorized sentinel). This
+// matters for retry classification: handleProcessEvent returns 410
+// permanent on errZoomUnauthorized but 500 retryable on everything
+// else. Misclassifying a transient 500 as permanent would drop the task.
+func TestStreamFileToDrive_Zoom500_ReturnsGenericError(t *testing.T) {
+	zoom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer zoom.Close()
+
+	srv := &Server{cfg: &Config{}}
+	file := RecordingFile{DownloadURL: zoom.URL}
+	err := srv.streamFileToDrive(context.Background(), nil, file, "tok", "parent", "name.mp4")
+	if err == nil {
+		t.Fatal("expected error on Zoom 500, got nil")
+	}
+	if errors.Is(err, errZoomUnauthorized) {
+		t.Errorf("err = %v, want generic error (500 is not 401 — must not be mis-classified)", err)
+	}
+}
+
+// TestStreamFileToDrive_NetworkError confirms that connection-level
+// failures (not HTTP-level) surface as errors without being
+// mis-classified as auth failures.
+func TestStreamFileToDrive_ConnectionError_ReturnsGenericError(t *testing.T) {
+	// Start and immediately stop a server so we have a guaranteed-unused
+	// local URL that will reject connections.
+	zoom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := zoom.URL
+	zoom.Close()
+
+	srv := &Server{cfg: &Config{}}
+	file := RecordingFile{DownloadURL: deadURL}
+	err := srv.streamFileToDrive(context.Background(), nil, file, "tok", "parent", "name.mp4")
+	if err == nil {
+		t.Fatal("expected error on connection refused, got nil")
+	}
+	if errors.Is(err, errZoomUnauthorized) {
+		t.Errorf("err = %v, want generic error (network error is not 401)", err)
 	}
 }
 
